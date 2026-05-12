@@ -1,0 +1,23 @@
+# Edge Function JWT verification (Stripe + client callbacks cannot send Supabase JWT).
+# https://supabase.com/docs/guides/functions/function-configuration
+
+[functions.stripe-checkout]
+verify_jwt = false
+
+[functions.stripe-success]
+verify_jwt = true
+
+[functions.stripe-cancel]
+verify_jwt = false
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.db-webhook-receiver]
+verify_jwt = false
+
+[functions.analyse-item]
+verify_jwt = true
+
+[functions.delete-account]
+verify_jwt = true

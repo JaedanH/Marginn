@@ -1,0 +1,31 @@
+---
+description: What Marginn is and how this repo is structured (read first for any Marginn work)
+alwaysApply: true
+---
+
+# Marginn — project context
+
+**Marginn** is a UK-focused **resale / arbitrage assistant** for second-hand sellers: users photograph an item, the app runs **AI vision** (Anthropic) to identify brand and item details, then enriches with **sold / listing prices** (eBay UK sold, Vinted, Depop via ScrapingBee). Output includes profit-style signals, scan history, referrals, and **Stripe** plans (free, Drop In, Scout, Trader, Pro).
+
+**Primary category today:** fashion and streetwear; prompts and comps lean that way.
+
+## Stack
+
+- **Frontend:** Vite + React + TypeScript + Tailwind, React Router (`src/`).
+- **Backend:** Supabase — Postgres (`profiles`, `scans`, `listing_cache`, `brands`, referrals, etc.), **Edge Functions** in `supabase/functions/` (`analyse-item`, `stripe-checkout`, `stripe-success`, `stripe-cancel`, …).
+- **Hosting:** Production site is often shipped via **Readdy**; Edge Functions and DB live on **Supabase** (not uploaded to Readdy). Frontend env: `VITE_PUBLIC_SUPABASE_URL`, `VITE_PUBLIC_SUPABASE_ANON_KEY`. Edge secrets (e.g. `STRIPE_SECRET_KEY`, `ANTHROPIC_API_KEY`, ScrapingBee) only in **Supabase Edge secrets**.
+- **Readdy + Cursor:** Use **GitHub** as the bridge (Cursor `git push` → Readdy **Pull**). Full steps and doc links: **`READDY_MIGRATION_NOTES.md` §0**. Set **`EDGE_EXTRA_ALLOWED_ORIGINS`** in Supabase for Readdy preview/custom domains.
+
+## Conventions for agents
+
+- Use **`src/lib/supabaseFunctions.ts`** (`supabaseFunctionUrl`) for Edge Function URLs — do not hardcode project refs in `src/`.
+- **Never commit API keys** in source; use env / Supabase secrets only.
+- After changing Edge Functions or SQL, user must **deploy / migrate on Supabase**; after changing `src/`, user must **redeploy the frontend** (e.g. Readdy).
+
+## Useful paths
+
+- App entry / routes: `src/App.tsx`, `src/router/`.
+- Auth & plan limits: `src/context/AuthContext.tsx`.
+- Scanner UI: `src/pages/scan/`.
+- Pricing / checkout trigger: `src/pages/pricing/page.tsx`.
+- Edge analyse + Stripe: `supabase/functions/analyse-item/`, `supabase/functions/stripe-*/`.
