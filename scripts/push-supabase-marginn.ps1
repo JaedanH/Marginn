@@ -16,6 +16,7 @@ supabase db push
 
 $functions = @(
   "analyse-item",
+  "authenticate-item",
   "delete-account",
   "stripe-checkout",
   "stripe-success",

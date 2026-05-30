@@ -58,15 +58,19 @@ There is no direct “plug Cursor into Readdy AI” link. You connect **the same
 
 **Theme:** Rows were blocked or skipped (RLS, grants, `user_id` resolution, NDJSON buffer, Edge `insertUserId`).
 
+**After-scan (2026):** `supabase/migrations/20260514120000_scan_watchlist_and_outcomes.sql` adds `scan_watchlist` (48h resale baseline, RLS by `user_id`) plus `scans.bought_at`, `bought_price_gbp`, `sold_at`, `sold_price_gbp`. Resale move alerts run on **dashboard load** in the SPA (no pg_cron in repo); optional cron + Edge is a later deploy.
+
 | Area | Paths to sync |
 |------|----------------|
-| **Migrations** | `supabase/migrations/20260511120000_scans_rls_own_rows.sql`, `supabase/migrations/20260512120000_scans_table_grants_rls.sql` |
+| **Migrations** | `supabase/migrations/20260511120000_scans_rls_own_rows.sql`, `supabase/migrations/20260512120000_scans_table_grants_rls.sql`, **`20260514120000_scan_watchlist_and_outcomes.sql`** |
 | **Edge** | `supabase/functions/analyse-item/index.ts` (persistence, JWT/`body.user_id`, optional `margin`, optional **`partner_shop_id`** / `partnerShopId` for charity shops — see §3c) |
 | **Client** | `src/pages/scan/page.tsx`, `src/lib/scanEdgeResponse.ts`, `src/context/AuthContext.tsx` (e.g. `decrementScan` / plan edge cases) |
 | **Auth helper** | `src/lib/authUserId.ts` (`resolveAuthUserId` — session/`getUser` fallback) |
 | **Lists** | `src/pages/dashboard/history/page.tsx`, `src/pages/dashboard/page.tsx`, `src/pages/home-logged-in/page.tsx` (fetch scans with correct user + RLS; later tweaks for count/limit — see §3) |
 
 **Supabase (manual):** Run migration SQL in Dashboard if you do not use `supabase db push`. Set Edge secret **`SUPABASE_SERVICE_ROLE_KEY`** on `analyse-item` if you rely on service-role inserts.
+
+**Authentication + M-Score (2026-05-29):** Migration `20260529120000_scans_auth_and_m_score.sql` — `authentication_result`, `authentication_score`, `authentication_verdict`, `m_score`, `m_score_breakdown` on `scans`. Edge: **`authenticate-item`** (Claude forensic auth), **`_shared/calculateMScore.ts`** wired in **`analyse-item`**. Deploy: `supabase functions deploy analyse-item` and `supabase functions deploy authenticate-item`. Client may POST `authenticate-item` with `imageBase64`, `mimeType`, `brandName`, `itemType`, `userId`, optional **`scan_id`** to persist on the scan row.
 
 ---
 

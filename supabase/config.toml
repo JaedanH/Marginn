@@ -21,3 +21,9 @@ verify_jwt = true
 
 [functions.delete-account]
 verify_jwt = true
+
+[functions.authenticate-item]
+verify_jwt = true
+
+[functions.build-whitelist]
+verify_jwt = false

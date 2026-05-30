@@ -30,15 +30,20 @@ export default function LoggedInHomePage() {
         setLoadingScans(false);
         return;
       }
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('scans')
         .select('id, brand_name, image_url, expected_resale_gbp, decision, created_at')
+        .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .limit(4);
+      if (error) console.error('[home-logged-in] scans fetch:', error);
       if (data) setRecentScans(data);
       setLoadingScans(false);
     };
     fetchScans();
+    const onSaved = () => void fetchScans();
+    window.addEventListener('marginn:scan-saved', onSaved);
+    return () => window.removeEventListener('marginn:scan-saved', onSaved);
   }, [user, session?.user?.id]);
 
   const handleSignOut = async () => {

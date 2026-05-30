@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { ScanResult } from './NewScanSection';
+import ComparablesSection from '../../scan/components/ComparablesSection';
 
 interface DashboardScanResultsProps {
   result: ScanResult;
@@ -166,7 +167,14 @@ export default function DashboardScanResults({
           </div>
         )}
 
-        {/* Platform prices */}
+        {/* Comparable items + platform prices */}
+        <ComparablesSection
+          comparables={result.comparables ?? null}
+          averagePrice={result.comparables_average_price ?? null}
+          overallConfidence={result.comparables_overall_confidence ?? null}
+          unavailableReason={result.comparables_unavailable_reason ?? null}
+        />
+
         <div className="bg-white rounded-xl border border-gray-200 p-6">
           <h3 className="text-sm font-semibold text-black mb-4">Platform Prices</h3>
           <div className="space-y-4">

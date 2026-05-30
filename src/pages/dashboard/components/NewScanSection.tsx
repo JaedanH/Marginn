@@ -1,7 +1,15 @@
 import { useState, useRef } from 'react';
 import { useAuth } from '../../../context/AuthContext';
 import { supabaseFunctionUrl } from '../../../lib/supabaseFunctions';
-import { encodeImageForScan, readNdjsonScanResponse } from '../../../lib/scanEdgeResponse';
+import { buildEffectiveMargin, encodeImageForScan, readNdjsonScanResponse } from '../../../lib/scanEdgeResponse';
+import {
+  resolveComparablesFromScanPayload,
+  type ComparablesPayload,
+} from '../../../lib/findBestComparables';
+import {
+  formatScanErrorForDisplay,
+  throwFromScanErrorPayload,
+} from '../../../lib/pipelineDiagnostics';
 import { edgeFunctionAuthHeaders } from '@/supabaseClient';
 import DashboardScanResults from './DashboardScanResults';
 
@@ -34,6 +42,10 @@ export interface ScanResult {
   platform_fee_gbp?: number;
   /** Fixed shipping assumption (£) */
   shipping_gbp?: number;
+  comparables?: ComparablesPayload | null;
+  comparables_average_price?: number | null;
+  comparables_overall_confidence?: number | null;
+  comparables_unavailable_reason?: string | null;
 }
 
 interface NewScanSectionProps {
@@ -87,12 +99,12 @@ function mapEdgeResponseToScanResult(data: Record<string, unknown>, buyPriceStr:
 
   const brandName = displayBrandFromAi(ai);
   const conditionGrade = String(ai.condition_grade ?? 'GOOD');
-  const mult = CONDITION_MULT[conditionGrade] ?? 0.85;
-  const brandBaseline = brandRow ? Number(brandRow.baseline_resale_gbp ?? 40) : 40;
-  const resale =
-    live?.ebay.scraped && live.ebay.avg > 0 ? Math.round(live.ebay.avg) : Math.round(brandBaseline * mult);
-
   const buyNum = buyPriceStr ? parseFloat(buyPriceStr) : 0;
+  const resale = buildEffectiveMargin(
+    data,
+    conditionGrade,
+    buyNum > 0 ? buyNum : undefined
+  ).resale_gbp;
   const platformFees = Math.round(resale * PLATFORM_FEES_RATE);
   const netAfterFees = Math.round(resale - platformFees - SHIPPING_COST);
   const netProfit = Math.round(resale - buyNum - platformFees - SHIPPING_COST);
@@ -106,6 +118,9 @@ function mapEdgeResponseToScanResult(data: Record<string, unknown>, buyPriceStr:
     live?.vinted.scraped && live.vinted.avg > 0 ? Math.round(live.vinted.avg) : Math.round(resale * 0.9);
   const depopAvg =
     live?.depop.scraped && live.depop.avg > 0 ? Math.round(live.depop.avg) : Math.round(resale * 1.0);
+
+  const { payload: comparablesParsed, unavailableReason: comparablesUnavailable } =
+    resolveComparablesFromScanPayload(data);
 
   return {
     brand_name: brandName,
@@ -134,6 +149,16 @@ function mapEdgeResponseToScanResult(data: Record<string, unknown>, buyPriceStr:
     era: String(ai.era ?? ''),
     platform_fee_gbp: platformFees,
     shipping_gbp: SHIPPING_COST,
+    comparables: comparablesParsed,
+    comparables_average_price:
+      typeof data.comparables_average_price === 'number'
+        ? data.comparables_average_price
+        : comparablesParsed?.average_price ?? null,
+    comparables_overall_confidence:
+      typeof data.comparables_overall_confidence === 'number'
+        ? data.comparables_overall_confidence
+        : comparablesParsed?.overall_confidence ?? null,
+    comparables_unavailable_reason: comparablesUnavailable,
   };
 }
 
@@ -195,13 +220,13 @@ export default function NewScanSection({
       });
 
       if (!response.ok) {
-        const errBody = (await response.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errBody.error ?? `Request failed (${response.status})`);
+        const errBody = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+        throwFromScanErrorPayload(errBody, response.status);
       }
 
       const contentType = response.headers.get('content-type') ?? '';
       const data = contentType.includes('application/x-ndjson')
-        ? await readNdjsonScanResponse(response)
+        ? await readNdjsonScanResponse(response, {})
         : await response.json();
 
       if ((data as { error?: string }).error) {
@@ -213,7 +238,10 @@ export default function NewScanSection({
           ? mapEdgeResponseToScanResult(data as Record<string, unknown>, buyPrice)
           : (() => {
               const buyNum = parseFloat(buyPrice) || 0;
-              const resale = Number(data.resale_price) || 0;
+              const resale =
+                typeof data.resale_price === 'number' && data.resale_price > 0
+                  ? Math.round(data.resale_price)
+                  : buildEffectiveMargin(data as Record<string, unknown>, 'GOOD').resale_gbp;
               const pf = Math.round(resale * PLATFORM_FEES_RATE);
               return {
                 brand_name: String(data.brand_name || 'Unknown Brand'),
@@ -248,8 +276,7 @@ export default function NewScanSection({
       setScanResult(result);
       onScanComplete(result);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Scan failed. Please try again.';
-      setError(msg);
+      setError(formatScanErrorForDisplay(err));
     } finally {
       setIsScanning(false);
     }
