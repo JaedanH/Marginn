@@ -27,10 +27,29 @@ function buildAllowedOriginSet(): Set<string> {
 
 const ALLOWED_SET = buildAllowedOriginSet();
 
+/** Readdy preview/publish hosts (editor + live sites not on marginn.co.uk yet). */
+function isReaddyBrowserOrigin(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return (
+    h === "readdy.ai" ||
+    h.endsWith(".readdy.ai") ||
+    h === "readdy.app" ||
+    h.endsWith(".readdy.app") ||
+    h.endsWith(".readdy.dev")
+  );
+}
+
 export function resolveAllowedBrowserOrigin(originHeader: string | null | undefined): string | null {
   const o = originHeader?.trim() ?? "";
   if (!o) return null;
-  return ALLOWED_SET.has(o) ? o : null;
+  if (ALLOWED_SET.has(o)) return o;
+  try {
+    const host = new URL(o).hostname;
+    if (isReaddyBrowserOrigin(host)) return o;
+  } catch {
+    /* ignore malformed Origin */
+  }
+  return null;
 }
 
 const BASE_CORS: Record<string, string> = {
