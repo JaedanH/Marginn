@@ -10,11 +10,44 @@ import { useToast } from '../../context/ToastContext';
 import { supabase, edgeFunctionAuthHeaders } from '@/supabaseClient';
 import { supabaseFunctionUrl, supabaseProjectUrl } from '../../lib/supabaseFunctions';
 import {
+  buildEffectiveMargin,
   encodeImageForScan,
   readNdjsonScanResponse,
   type AnalyseItemCompletePayload,
   type AnalyseItemMargin,
+  type FlipScoreBreakdownPayload,
 } from '../../lib/scanEdgeResponse';
+import {
+  formatScanErrorForDisplay,
+  pipelineReportFromComplete,
+  throwFromScanErrorPayload,
+  type PipelineReport,
+} from '../../lib/pipelineDiagnostics';
+import { ensureScanPersisted } from '../../lib/ensureScanPersisted';
+import {
+  CONDITION_MULTIPLIER,
+  isResaleDisplaySuppressed,
+  MARGIN_BUFFER_GBP,
+  PLATFORM_FEE_RATE,
+  SHIPPING_GBP,
+  parseAuthenticationFlags,
+} from '../../lib/scanEconomics';
+import { resolveAuthUserId } from '../../lib/authUserId';
+import { countPeersSameBrand, formatBrandHistoryLine } from '../../lib/scanBrandAggregates';
+import { watchlistUntilIso } from '../../lib/watchlistConstants';
+import { MarkBoughtDialog, MarkSoldDialog } from '../dashboard/history/components/ScanOutcomeDialogs';
+import {
+  fetchForensicAuthentication,
+  parseForensicAuthentication,
+  type ForensicAuthentication,
+} from '../../lib/forensicAuthentication';
+import {
+  applyComparableRemoval,
+  resolveComparablesFromScanPayload,
+  recalculateMScoreFromComparables,
+  type ComparableListing,
+  type ComparablesPayload,
+} from '../../lib/findBestComparables';
 
 const STRIPE_SUCCESS_URL = supabaseFunctionUrl('stripe-success');
 const EDGE_FN_URL = supabaseFunctionUrl('analyse-item');
@@ -46,6 +79,8 @@ export interface IdentifiedItem {
     listings: number;
     soldListings: number;
     url: string;
+    /** Live scrape succeeded (median meaningful) */
+    scraped?: boolean;
   }[];
   priceHistory: {
     date: string;
@@ -61,11 +96,64 @@ export interface IdentifiedItem {
   marginBufferGbp?: number;
   /** Deterministic short id from Edge vision hash (or client fallback). */
   fingerprint?: string;
+  /** Raw vision grade e.g. GOOD — for condition-upgrade hint */
+  conditionGrade?: string;
+  authenticationFlags?: string[];
+  /** Optional Edge-supplied eBay price trend (% vs older sold comps). */
+  ebayPriceTrendPct?: number | null;
+  /** Resale from brand baseline / table — no live eBay sold median (aligns with Edge `used_fallback_resale`). */
+  usedFallbackResale?: boolean;
+  identificationFromCache?: boolean;
+  scrapedAt?: string | null;
+  priceExtractionMethod?: "vision" | "regex_fallback" | "finding_api";
+  priceExtractionMethods?: {
+    ebay?: "vision" | "regex_fallback" | "finding_api";
+    vinted?: "vision" | "regex_fallback" | "finding_api";
+    depop?: "vision" | "regex_fallback" | "finding_api";
+  };
+  /** Fewer than MIN_EBAY_SOLD_COMPS — hide resale £, show manual browse CTA. */
+  insufficientSoldData?: boolean;
+  ebaySoldCompCount?: number;
+  /** Client clock when the complete payload arrived. */
+  scanReceivedAtMs?: number;
+  /** Data-backed flip score from Edge (`calculateFlipScore`); not Claude `trend_score`. */
+  flipScore?: number | null;
+  flipScoreBreakdown?: FlipScoreBreakdownPayload | null;
+  soldVelocity?: { d7: number; d30: number } | null;
+  /** Claude vision `trend_score` (0–15) — hints only (e.g. PRICE VOLATILE flag). */
+  visionTrendHint?: number | null;
+  /** Visible size text from vision (`size_label`). */
+  sizeLabel?: string;
+  /** `scans.share_token` for public `/share/scan/:token` link. */
+  shareToken?: string;
+  /** Claude forensic auth from `authenticate-item`. */
+  forensicAuth?: ForensicAuthentication | null;
+  forensicAuthScore?: number | null;
+  forensicAuthVerdict?: string | null;
+  forensicAuthLoading?: boolean;
+  /** Marginn M-Score 0–100 from Edge `calculateMScore`. */
+  mScore?: number | null;
+  mScoreBreakdown?: Record<string, unknown> | null;
+  /** Edge pipeline diagnosis (E-/U- codes, stages) — for support and UI hints. */
+  pipelineReport?: PipelineReport | null;
+  /** System-side partial failure message (E-*), when scan still completes. */
+  pipelineSystemWarning?: string | null;
+  comparables?: ComparablesPayload | null;
+  comparablesAveragePrice?: number | null;
+  comparablesOverallConfidence?: number | null;
+  comparablesUnavailableReason?: string | null;
 }
 
 type ScanMode = 'Safe' | 'Standard' | 'Aggressive';
 
 const SCAN_UPLOAD_TIP_KEY = 'marginn_scan_upload_tip_dismissed';
+const MAX_STAGED_PHOTOS = 3;
+
+type StagedPhoto = { id: string; file: File; preview: string };
+
+function newPhotoId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
 
 const PARTNER_SHOP_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -107,6 +195,76 @@ function clientScanFingerprintFallback(item: IdentifiedItem): string {
   return ((h >>> 0).toString(16).padStart(8, '0')).slice(0, 10);
 }
 
+function mapSoldCompPreviews(raw: unknown, scanId: string): ListingCacheRow[] {
+  if (!Array.isArray(raw) || !scanId) return [];
+  return raw.slice(0, 12).map((row, i) => {
+    const r = row as Record<string, unknown>;
+    const price = r.price_gbp;
+    return {
+      id: String(r.id ?? `preview-${i}`),
+      scan_id: String(r.scan_id ?? scanId),
+      platform: String(r.platform ?? 'ebay'),
+      title: typeof r.title === 'string' ? r.title : null,
+      price_gbp: typeof price === 'number' ? price : Number(price) || null,
+      image_url: typeof r.image_url === 'string' ? r.image_url : null,
+      listing_url: typeof r.listing_url === 'string' ? r.listing_url : null,
+      days_ago: typeof r.days_ago === 'number' ? r.days_ago : null,
+    };
+  });
+}
+
+function enrichIdentifiedWithTrust(
+  item: IdentifiedItem,
+  responseData: Record<string, unknown>,
+  receivedAtMs: number
+): IdentifiedItem {
+  const ebayPlat = item.platforms.find((p) => p.name === 'eBay');
+  const lp = responseData.livePrices as { ebay?: { scraped?: boolean; avg?: number } } | undefined;
+  const ebayScraped =
+    typeof ebayPlat?.scraped === 'boolean'
+      ? ebayPlat.scraped
+      : Boolean(lp?.ebay?.scraped && (lp.ebay?.avg ?? 0) > 0);
+
+  const usedFallback =
+    typeof responseData.used_fallback_resale === 'boolean'
+      ? (responseData.used_fallback_resale as boolean)
+      : !ebayScraped;
+
+  const pem = responseData.price_extraction_method;
+  const priceExtractionMethod =
+    pem === 'vision' || pem === 'regex_fallback' || pem === 'finding_api' ? pem : undefined;
+  const pemMap = responseData.price_extraction_methods;
+  const priceExtractionMethods =
+    pemMap && typeof pemMap === 'object' && !Array.isArray(pemMap)
+      ? (pemMap as IdentifiedItem['priceExtractionMethods'])
+      : undefined;
+
+  const compCount =
+    typeof responseData.ebay_sold_comp_count === 'number'
+      ? responseData.ebay_sold_comp_count
+      : undefined;
+
+  const pipelineReport = pipelineReportFromComplete(responseData);
+  const pipelineSystemWarning =
+    pipelineReport?.issue_category === 'system' && pipelineReport.pipeline_status !== 'ok'
+      ? pipelineReport.user_message
+      : null;
+
+  return {
+    ...item,
+    usedFallbackResale: usedFallback,
+    identificationFromCache: responseData.identification_from_cache === true,
+    scrapedAt: typeof responseData.scraped_at === 'string' ? responseData.scraped_at : null,
+    priceExtractionMethod,
+    priceExtractionMethods,
+    insufficientSoldData: isResaleDisplaySuppressed(responseData),
+    ebaySoldCompCount: compCount,
+    scanReceivedAtMs: receivedAtMs,
+    pipelineReport: pipelineReport ?? null,
+    pipelineSystemWarning,
+  };
+}
+
 const MODE_CONFIG: Record<ScanMode, { label: string; desc: string; color: string; active: string }> = {
   Safe: {
     label: 'Safe',
@@ -138,20 +296,6 @@ const CONDITION_LABEL: Record<string, string> = {
   HEAVY_WEAR: 'Heavy Wear',
 };
 
-// Condition multiplier applied to baseline resale price
-const CONDITION_MULTIPLIER: Record<string, number> = {
-  LIKE_NEW: 1.0,
-  GOOD: 0.85,
-  LIGHT_WEAR: 0.72,
-  FADED: 0.55,
-  CRACKED_LOGO: 0.45,
-  STAINS: 0.35,
-  HEAVY_WEAR: 0.30,
-};
-
-const PLATFORM_FEES_RATE = 0.12;
-const SHIPPING_COST = 4;
-
 function isUnknownBrandLabel(s: string): boolean {
   const t = s.trim().toLowerCase();
   return !t || t === 'unknown' || t === 'unknown brand' || t === 'n/a' || t === 'none';
@@ -166,6 +310,11 @@ function displayBrandFromAi(aiData: Record<string, unknown>): string {
     .map((x) => String(x ?? '').trim())
     .filter((p) => p && !isUnknownBrandLabel(p));
   return parts.length ? `${parts.join(' ')} (brand unclear)` : 'Unknown Brand';
+}
+
+function sizeLabelFromAi(ai: Record<string, unknown>): string | undefined {
+  const s = String(ai.size_label ?? '').trim();
+  return s || undefined;
 }
 
 function deriveVerdict(netProfit: number, mode: ScanMode): 'BUY' | 'MAYBE' | 'SKIP' {
@@ -220,17 +369,32 @@ function buildResultFromAI(
       : brandConfidenceRaw > 1
         ? brandConfidenceRaw / 100
         : 0;
-  const trendScore = (aiData.trend_score as number) ?? 5;
+  const visionTrendHint = Number(aiData.trend_score ?? 5) || 5;
   const colour = (aiData.colour as string) ?? '';
   const gender = (aiData.gender as string) ?? '';
 
   // eBay sold listings already reflect real market prices for items in any condition.
   // Use eBay avg directly as resaleValue — NO condition multiplier on top.
   // Only fall back to brand baseline × condition multiplier if eBay has no data.
-  const brandBaseline = brandRow ? Number(brandRow.baseline_resale_gbp ?? 40) : 40;
-  const resaleValue = (livePrices?.ebay.scraped && livePrices.ebay.avg > 0)
-    ? Math.round(livePrices.ebay.avg)
-    : Math.round(brandBaseline * conditionMult);
+  const brandBaselineRaw = brandRow ? Number(brandRow.baseline_resale_gbp ?? 40) : 40;
+  const brandBaseline =
+    Number.isFinite(brandBaselineRaw) && brandBaselineRaw > 0 ? brandBaselineRaw : 40;
+  const resaleFromEbay =
+    livePrices?.ebay.scraped && livePrices.ebay.avg > 0
+      ? Math.round(livePrices.ebay.avg)
+      : 0;
+  const resaleFromAlt =
+    livePrices?.vinted.scraped && livePrices.vinted.avg > 0
+      ? Math.round(livePrices.vinted.avg)
+      : livePrices?.depop.scraped && livePrices.depop.avg > 0
+        ? Math.round(livePrices.depop.avg)
+        : 0;
+  const resaleValue =
+    resaleFromEbay > 0
+      ? resaleFromEbay
+      : resaleFromAlt > 0
+        ? resaleFromAlt
+        : Math.max(12, Math.round(brandBaseline * conditionMult));
 
   // Platform prices: prefer live scraped data, fall back to brand table ranges
   const brandVintedFallback = brandRow
@@ -248,20 +412,22 @@ function buildResultFromAI(
     ? livePrices.depop.avg
     : (brandDepopFallback || resaleValue);
 
-  const ebayListings = livePrices?.ebay.scraped ? livePrices.ebay.listings : 61;
-  const ebaySoldCount = livePrices?.ebay.scraped ? livePrices.ebay.soldCount : 49;
+  const ebayListings = livePrices?.ebay.scraped ? livePrices.ebay.listings : 0;
+  const ebaySoldCount = livePrices?.ebay.scraped ? livePrices.ebay.soldCount : 0;
 
   const buyPriceNum = buyPriceStr ? parseFloat(buyPriceStr) : 0;
-  const platformFees = Math.round(resaleValue * PLATFORM_FEES_RATE);
-  const netProfit = Math.round(resaleValue - buyPriceNum - platformFees - SHIPPING_COST);
-  const maxBuyPrice = Math.round(resaleValue - platformFees - SHIPPING_COST - 10);
+  const platformFees = Math.round(resaleValue * PLATFORM_FEE_RATE);
+  const netProfit = Math.round(resaleValue - buyPriceNum - platformFees - SHIPPING_GBP);
+  const maxBuyPrice = Math.round(
+    resaleValue - platformFees - SHIPPING_GBP - MARGIN_BUFFER_GBP
+  );
   const verdict = deriveVerdict(netProfit, mode);
 
   const flags: string[] = [];
   if (brandConfidence < 0.6) flags.push('LOW CONFIDENCE');
   if (['FADED', 'CRACKED_LOGO', 'STAINS', 'HEAVY_WEAR'].includes(conditionGrade)) flags.push('CONDITION PENALTY');
   if (mode === 'Aggressive') flags.push('HIGH COMPETITION');
-  if (trendScore >= 12) flags.push('PRICE VOLATILE');
+  if (visionTrendHint >= 12) flags.push('PRICE VOLATILE');
 
   const itemDesc = [colour, gender, brandName].filter(Boolean).join(' ');
 
@@ -281,9 +447,30 @@ function buildResultFromAI(
     maxBuyPrice,
     flags,
     platforms: [
-      { name: 'Vinted', avgPrice: vintedAvg, listings: 0, soldListings: 0, url: 'https://vinted.co.uk' },
-      { name: 'Depop', avgPrice: depopAvg, listings: 0, soldListings: 0, url: 'https://depop.com' },
-      { name: 'eBay', avgPrice: ebayAvg, listings: ebayListings, soldListings: ebaySoldCount, url: 'https://ebay.co.uk' },
+      {
+        name: 'Vinted',
+        avgPrice: vintedAvg,
+        listings: livePrices?.vinted.scraped ? livePrices.vinted.listings : 0,
+        soldListings: 0,
+        url: 'https://vinted.co.uk',
+        scraped: Boolean(livePrices?.vinted.scraped && livePrices.vinted.avg > 0),
+      },
+      {
+        name: 'Depop',
+        avgPrice: depopAvg,
+        listings: livePrices?.depop.scraped ? livePrices.depop.listings : 0,
+        soldListings: 0,
+        url: 'https://depop.com',
+        scraped: Boolean(livePrices?.depop.scraped && livePrices.depop.avg > 0),
+      },
+      {
+        name: 'eBay',
+        avgPrice: ebayAvg,
+        listings: ebayListings,
+        soldListings: ebaySoldCount,
+        url: 'https://ebay.co.uk',
+        scraped: Boolean(livePrices?.ebay.scraped && livePrices.ebay.avg > 0),
+      },
     ],
     priceHistory: [
       { date: '2024-01', price: Math.round(resaleValue * 0.85) },
@@ -294,7 +481,145 @@ function buildResultFromAI(
       { date: '2024-06', price: Math.round(resaleValue * 1.02) },
     ],
     platformFeeGbp: platformFees,
-    shippingGbp: SHIPPING_COST,
+    shippingGbp: SHIPPING_GBP,
+    conditionGrade,
+    authenticationFlags: parseAuthenticationFlags(
+      aiData.authentication_flags ?? aiData.authenticationFlags
+    ),
+    sizeLabel: sizeLabelFromAi(aiData),
+  };
+}
+
+/** Stage A: identification only (no live prices / margin — UI uses `pricesLoading` skeletons). */
+function buildPartialIdentifiedFromStreamAnalysis(
+  data: Record<string, unknown>,
+  mode: ScanMode,
+  previewImageUrl: string,
+  buyPriceStr: string
+): IdentifiedItem {
+  const imageUrl =
+    typeof data.imageUrl === 'string' && data.imageUrl.trim()
+      ? data.imageUrl.trim()
+      : previewImageUrl;
+
+  const scanId =
+    (typeof data.scanId === 'string' && data.scanId.trim()) ||
+    (typeof data.scan_id === 'string' && data.scan_id.trim()) ||
+    undefined;
+
+  const searchQuery = typeof data.searchQuery === 'string' ? data.searchQuery.trim() : '';
+  const buyPriceNum = buyPriceStr ? parseFloat(buyPriceStr) : 0;
+
+  const fpRaw = data.fingerprint;
+  const fingerprintFromEdge = typeof fpRaw === 'string' && fpRaw.trim() ? fpRaw.trim() : '';
+
+  const placeholderPlatforms: IdentifiedItem['platforms'] = [
+    { name: 'Vinted', avgPrice: 0, listings: 0, soldListings: 0, url: 'https://vinted.co.uk' },
+    { name: 'Depop', avgPrice: 0, listings: 0, soldListings: 0, url: 'https://depop.com' },
+    { name: 'eBay', avgPrice: 0, listings: 0, soldListings: 0, url: 'https://ebay.co.uk' },
+  ];
+
+  const emptyPlatforms = placeholderPlatforms;
+
+  // Nested `{ ai, brand, ... }` shape (legacy Edge payload)
+  if (data.ai && typeof data.ai === 'object') {
+    const ai = data.ai as Record<string, unknown>;
+    const brandRow = (data.brand as Record<string, unknown> | null) ?? null;
+    const brandName = displayBrandFromAi(ai);
+    const conditionGrade = (ai.condition_grade as string) || 'GOOD';
+    const conditionLabel = CONDITION_LABEL[conditionGrade] ?? conditionGrade;
+    const brandConfidenceRaw = Number(ai.brand_confidence ?? 0);
+    const brandConfidence =
+      brandConfidenceRaw > 0 && brandConfidenceRaw <= 1
+        ? brandConfidenceRaw
+        : brandConfidenceRaw > 1
+          ? brandConfidenceRaw / 100
+          : 0;
+    const visionTrendHint = Number(ai.trend_score ?? 5) || 5;
+    const colour = (ai.colour as string) ?? '';
+    const gender = (ai.gender as string) ?? '';
+    const productLine =
+      [String(ai.sub_brand ?? ''), String(ai.item_type ?? '')].filter(Boolean).join(' · ') || undefined;
+    const itemDesc = [colour, gender, brandName].filter(Boolean).join(' ');
+
+    const flags: string[] = [];
+    if (brandConfidence < 0.6) flags.push('LOW CONFIDENCE');
+    if (['FADED', 'CRACKED_LOGO', 'STAINS', 'HEAVY_WEAR'].includes(conditionGrade)) flags.push('CONDITION PENALTY');
+    if (mode === 'Aggressive') flags.push('HIGH COMPETITION');
+    if (visionTrendHint >= 12) flags.push('PRICE VOLATILE');
+
+    const category = (brandRow?.category_default as string) ?? 'Clothing';
+    const conditionGradeUpper = String(conditionGrade).toUpperCase();
+    const base: IdentifiedItem = {
+      id: `stream-partial-${Date.now()}`,
+      brand: brandName,
+      productLine,
+      itemName: itemDesc || brandName,
+      category,
+      condition: conditionLabel,
+      imageUrl,
+      retailPrice: 0,
+      purchaseCost: buyPriceNum || undefined,
+      scanMode: mode,
+      platforms: emptyPlatforms,
+      priceHistory: [],
+      flags,
+      searchTerm: searchQuery || [brandName, productLine].filter(Boolean).join(' ') || brandName,
+      scanId,
+      conditionGrade: conditionGradeUpper,
+      authenticationFlags: parseAuthenticationFlags(
+        ai.authentication_flags ?? ai.authenticationFlags
+      ),
+      ebayPriceTrendPct: null,
+      sizeLabel: sizeLabelFromAi(ai),
+    };
+    return {
+      ...base,
+      fingerprint: fingerprintFromEdge || clientScanFingerprintFallback(base),
+    };
+  }
+
+  // Flat new-API shape on stream chunk
+  const brandName = displayBrandFromAi(data);
+  const conditionGrade = (data.condition_grade as string) || 'GOOD';
+  const conditionLabel = CONDITION_LABEL[conditionGrade] ?? conditionGrade;
+  const conditionGradeUpper = String(conditionGrade).toUpperCase();
+  const brandConfidence = (data.brand_confidence as number) ?? 0;
+  const conf01 = brandConfidence > 1 ? brandConfidence / 100 : brandConfidence;
+  const flags: string[] = [];
+  if (conf01 < 0.6) flags.push('LOW CONFIDENCE');
+  if (['FADED', 'CRACKED_LOGO', 'STAINS', 'HEAVY_WEAR'].includes(conditionGrade)) flags.push('CONDITION PENALTY');
+  if (mode === 'Aggressive') flags.push('HIGH COMPETITION');
+
+  const productLine = (data.product_line as string) || undefined;
+  const base: IdentifiedItem = {
+    id: `stream-partial-${Date.now()}`,
+    brand: brandName,
+    productLine,
+    itemName: productLine || brandName,
+    category: 'Clothing',
+    condition: conditionLabel,
+    imageUrl,
+    retailPrice: 0,
+    purchaseCost: buyPriceNum || undefined,
+    scanMode: mode,
+    platforms: emptyPlatforms,
+    priceHistory: [],
+    flags,
+    explainFlags: (data.explain_flags as string[]) ?? [],
+    gptVerified: (data.gpt_verified as boolean) ?? false,
+    searchTerm: searchQuery || [brandName, productLine].filter(Boolean).join(' ') || brandName,
+    scanId,
+    conditionGrade: conditionGradeUpper,
+    authenticationFlags: parseAuthenticationFlags(
+      data.authentication_flags ?? data.authenticationFlags
+    ),
+    ebayPriceTrendPct: null,
+    sizeLabel: sizeLabelFromAi(data),
+  };
+  return {
+    ...base,
+    fingerprint: fingerprintFromEdge || clientScanFingerprintFallback(base),
   };
 }
 
@@ -307,17 +632,22 @@ function buildResultFromNewAPI(
   const brandName = displayBrandFromAi(data);
   const productLine = (data.product_line as string) || '';
   const conditionGrade = (data.condition_grade as string) || 'GOOD';
+  const cgNorm = String(conditionGrade).toUpperCase();
   const conditionLabel = CONDITION_LABEL[conditionGrade] ?? conditionGrade;
   const brandConfidence = (data.brand_confidence as number) ?? 0;
-  const resalePrice = (data.resale_price as number) ?? 0;
+  const cgFlat = String(data.condition_grade ?? 'GOOD').toUpperCase();
+  const resalePrice =
+    typeof data.resale_price === 'number' && data.resale_price > 0
+      ? Math.round(data.resale_price as number)
+      : buildEffectiveMargin(data, cgFlat).resale_gbp;
   const netAfterFees = (data.net_after_fees as number) ?? 0;
   const profitFromAPI = (data.profit as number) ?? 0;
-  const platformFeesCalc = Math.round(resalePrice * PLATFORM_FEES_RATE);
+  const platformFeesCalc = Math.round(resalePrice * PLATFORM_FEE_RATE);
   const maxBuyFromApi = (data.max_buy as number) ?? 0;
   const maxBuy =
     maxBuyFromApi > 0
       ? maxBuyFromApi
-      : Math.round(resalePrice - platformFeesCalc - SHIPPING_COST - 10);
+      : Math.round(resalePrice - platformFeesCalc - SHIPPING_GBP - MARGIN_BUFFER_GBP);
   const decision = (data.decision as string) ?? 'MAYBE';
   const explainFlags = (data.explain_flags as string[]) ?? [];
   const gptVerified = (data.gpt_verified as boolean) ?? false;
@@ -362,10 +692,35 @@ function buildResultFromNewAPI(
     explainFlags,
     gptVerified,
     ebayCount,
+    conditionGrade,
+    authenticationFlags: parseAuthenticationFlags(
+      data.authentication_flags ?? data.authenticationFlags
+    ),
     platforms: [
-      { name: 'Vinted', avgPrice: vintedPrice, listings: 0, soldListings: 0, url: 'https://vinted.co.uk' },
-      { name: 'Depop', avgPrice: depopPrice, listings: 0, soldListings: 0, url: 'https://depop.com' },
-      { name: 'eBay', avgPrice: ebayPrice, listings: ebayCount, soldListings: ebayCount, url: 'https://ebay.co.uk' },
+      {
+        name: 'Vinted',
+        avgPrice: vintedPrice,
+        listings: 0,
+        soldListings: 0,
+        url: 'https://vinted.co.uk',
+        scraped: platformPrices.vinted != null && platformPrices.vinted > 0,
+      },
+      {
+        name: 'Depop',
+        avgPrice: depopPrice,
+        listings: 0,
+        soldListings: 0,
+        url: 'https://depop.com',
+        scraped: platformPrices.depop != null && platformPrices.depop > 0,
+      },
+      {
+        name: 'eBay',
+        avgPrice: ebayPrice,
+        listings: ebayCount,
+        soldListings: ebayCount,
+        url: 'https://ebay.co.uk',
+        scraped: platformPrices.ebay != null && platformPrices.ebay > 0,
+      },
     ],
     priceHistory: [
       { date: '2024-01', price: Math.round(resalePrice * 0.85) },
@@ -376,7 +731,8 @@ function buildResultFromNewAPI(
       { date: '2024-06', price: Math.round(resalePrice * 1.02) },
     ],
     platformFeeGbp: platformFeesCalc,
-    shippingGbp: SHIPPING_COST,
+    shippingGbp: SHIPPING_GBP,
+    sizeLabel: sizeLabelFromAi(data),
   };
 }
 
@@ -428,8 +784,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
   const [identifiedItem, setIdentifiedItem] = useState<IdentifiedItem | null>(null);
   const [savedItems, setSavedItems] = useState<IdentifiedItem[]>([]);
   const [boughtItems, setBoughtItems] = useState<BoughtItem[]>(MOCK_BOUGHT_ITEMS);
-  const [selectedImage, setSelectedImage] = useState<string | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [stagedPhotos, setStagedPhotos] = useState<StagedPhoto[]>([]);
   const [buyPrice, setBuyPrice] = useState('');
   const [scanMode, setScanMode] = useState<ScanMode>('Standard');
   const [isScanning, setIsScanning] = useState(false);
@@ -438,7 +793,14 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
   const [scanStep, setScanStep] = useState(1);
   const [brandsCount, setBrandsCount] = useState<number | null>(null);
   const [ebayListings, setEbayListings] = useState<ListingCacheRow[]>([]);
+  const [comparables, setComparables] = useState<ComparablesPayload | null>(null);
+  const [comparablesUnavailableReason, setComparablesUnavailableReason] = useState<string | null>(
+    null
+  );
+  const [removedComparableIds, setRemovedComparableIds] = useState<Set<string>>(() => new Set());
   const [flagsOpen, setFlagsOpen] = useState(false);
+  /** True after `analysis` NDJSON event until full merge from `complete`. */
+  const [pricesLoading, setPricesLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
@@ -454,6 +816,19 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       return true;
     }
   });
+  const [brandHistoryLine, setBrandHistoryLine] = useState<string | null>(null);
+  const [watchlistActive, setWatchlistActive] = useState(false);
+  const [watchUntilLabel, setWatchUntilLabel] = useState<string | null>(null);
+  const [watchPriceBusy, setWatchPriceBusy] = useState(false);
+  const [outcomeRow, setOutcomeRow] = useState<{
+    bought_at: string | null;
+    sold_at: string | null;
+    bought_price_gbp: number | null;
+    buy_price_gbp: number | null;
+  } | null>(null);
+  const [boughtDialogOpen, setBoughtDialogOpen] = useState(false);
+  const [soldDialogOpen, setSoldDialogOpen] = useState(false);
+  const forensicAuthScanIdRef = useRef<string | null>(null);
 
   const dismissUploadTip = () => {
     try {
@@ -488,6 +863,85 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
         else if (data) setEbayListings(data as ListingCacheRow[]);
       });
   }, [identifiedItem?.scanId]);
+
+  useEffect(() => {
+    if (!identifiedItem?.scanId || !identifiedItem.brand) {
+      setBrandHistoryLine(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const uid = await resolveAuthUserId(user?.id ?? session?.user?.id);
+      if (!uid || cancelled) return;
+      const { data, error } = await supabase
+        .from('scans')
+        .select('id, brand_name, roi')
+        .eq('user_id', uid)
+        .limit(2000);
+      if (error || cancelled || !data) return;
+      const { otherCount, avgRoiPct } = countPeersSameBrand(
+        data as { id: string; brand_name: string | null; roi: number | null }[],
+        identifiedItem.brand,
+        identifiedItem.scanId
+      );
+      setBrandHistoryLine(formatBrandHistoryLine(identifiedItem.brand, otherCount, avgRoiPct));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [identifiedItem?.scanId, identifiedItem?.brand, user?.id, session?.user?.id]);
+
+  useEffect(() => {
+    if (!identifiedItem?.scanId) {
+      setOutcomeRow(null);
+      setWatchlistActive(false);
+      setWatchUntilLabel(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const uid = await resolveAuthUserId(user?.id ?? session?.user?.id);
+      if (!uid) return;
+      const [{ data: scanRow }, { data: wlRow }] = await Promise.all([
+        supabase
+          .from('scans')
+          .select('bought_at, sold_at, bought_price_gbp, buy_price_gbp')
+          .eq('id', identifiedItem.scanId)
+          .eq('user_id', uid)
+          .maybeSingle(),
+        supabase
+          .from('scan_watchlist')
+          .select('created_at')
+          .eq('scan_id', identifiedItem.scanId)
+          .eq('user_id', uid)
+          .maybeSingle(),
+      ]);
+      if (cancelled) return;
+      setOutcomeRow(
+        scanRow as {
+          bought_at: string | null;
+          sold_at: string | null;
+          bought_price_gbp: number | null;
+          buy_price_gbp: number | null;
+        } | null
+      );
+      if (wlRow?.created_at) {
+        setWatchlistActive(true);
+        setWatchUntilLabel(
+          new Date(watchlistUntilIso(wlRow.created_at as string)).toLocaleString('en-GB', {
+            dateStyle: 'medium',
+            timeStyle: 'short',
+          })
+        );
+      } else {
+        setWatchlistActive(false);
+        setWatchUntilLabel(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [identifiedItem?.scanId, user?.id, session?.user?.id]);
 
   // Handle Stripe payment success redirect
   useEffect(() => {
@@ -571,38 +1025,72 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       .catch((e) => console.log('Error:', e));
   }, []);
 
-  const handleFile = (file: File) => {
-    if (file.size > 10 * 1024 * 1024) { setError('File must be under 10MB'); return; }
-    if (!file.type.startsWith('image/')) { setError('Please select an image file'); return; }
+  const addStagedFiles = (files: FileList | File[]) => {
+    const list = Array.from(files as unknown as File[]).filter((f) => f.type.startsWith('image/'));
+    if (list.length === 0) {
+      setError('Please select image files');
+      return;
+    }
     setError(null);
-    setSelectedFile(file);
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      if (e.target?.result) {
-        setSelectedImage(e.target.result as string);
+    setStagedPhotos((prev) => {
+      const next = [...prev];
+      for (const file of list) {
+        if (next.length >= MAX_STAGED_PHOTOS) break;
+        if (file.size > 10 * 1024 * 1024) {
+          setError('Each file must be under 10MB');
+          continue;
+        }
+        next.push({ id: newPhotoId(), file, preview: URL.createObjectURL(file) });
       }
-    };
-    reader.onerror = () => setError('Failed to read the file. Please try again.');
-    reader.readAsDataURL(file);
+      return next;
+    });
+  };
+
+  const removeStagedPhoto = (id: string) => {
+    setStagedPhotos((prev) => {
+      const t = prev.find((p) => p.id === id);
+      if (t) URL.revokeObjectURL(t.preview);
+      return prev.filter((p) => p.id !== id);
+    });
+  };
+
+  const clearAllStagedPhotos = () => {
+    setStagedPhotos((prev) => {
+      prev.forEach((p) => URL.revokeObjectURL(p.preview));
+      return [];
+    });
+  };
+
+  const prepareNewPhotoCapture = () => {
+    clearAllStagedPhotos();
+    setError(null);
+    setActiveTab('scan');
+    requestAnimationFrame(() => fileInputRef.current?.click());
   };
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (file) handleFile(file);
+    if (e.dataTransfer.files?.length) addStagedFiles(e.dataTransfer.files);
   };
 
   const handleScan = async () => {
-    if (!selectedImage || !selectedFile) return;
+    if (stagedPhotos.length === 0) return;
+    const snapPhotos = [...stagedPhotos];
+    const heroPreviewUrl = snapPhotos[0]?.preview ?? '';
     setIsScanning(true);
     setError(null);
     setScanStep(1);
     setEbayListings([]);
+    setComparables(null);
+    setComparablesUnavailableReason(null);
+    setRemovedComparableIds(new Set());
+    setPricesLoading(true);
 
+    let scanCompleted = false;
     try {
-      const encoded = await encodeImageForScan(selectedFile);
-      if (!encoded.base64) {
+      const encodedList = await Promise.all(snapPhotos.map((p) => encodeImageForScan(p.file)));
+      if (encodedList.some((e) => !e.base64)) {
         throw new Error('Failed to prepare image');
       }
 
@@ -626,35 +1114,64 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
           showToast('That shop link does not match your partner account.', 'error'),
       });
 
+      const scanBody: Record<string, unknown> = {
+        buy_price: buyPrice ? parseFloat(buyPrice) : 0,
+        mode: scanMode.toLowerCase(),
+        user_id: effectiveUserId,
+        stream: true,
+        ...(partnerShopForBody ? { partner_shop_id: partnerShopForBody } : {}),
+      };
+      if (encodedList.length === 1) {
+        const e = encodedList[0]!;
+        scanBody.image_base64 = `data:${e.mimeType};base64,${e.base64}`;
+        scanBody.image_type = e.mimeType;
+      } else {
+        scanBody.images = encodedList.map((e) => ({
+          base64: `data:${e.mimeType};base64,${e.base64}`,
+          mime: e.mimeType,
+        }));
+      }
+
+      const edgeHeaders = await edgeFunctionAuthHeaders({ session: scanSession });
+      if (!edgeHeaders.Authorization) {
+        console.warn('[Scan] No access token on analyse-item request — history may not save');
+      }
+
       const res = await fetch(EDGE_FN_URL, {
         method: 'POST',
-        headers: await edgeFunctionAuthHeaders({ session: scanSession }),
-        body: JSON.stringify({
-          // Edge image validator accepts data URLs or raw base64 + mimeType; data URL is unambiguous.
-          image_base64: `data:${encoded.mimeType};base64,${encoded.base64}`,
-          image_type: encoded.mimeType,
-          buy_price: buyPrice ? parseFloat(buyPrice) : 0,
-          mode: scanMode.toLowerCase(),
-          user_id: effectiveUserId,
-          stream: true,
-          ...(partnerShopForBody ? { partner_shop_id: partnerShopForBody } : {}),
-        }),
+        headers: edgeHeaders,
+        body: JSON.stringify(scanBody),
       });
 
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error((errData as { error?: string }).error ?? `Request failed (${res.status})`);
+        const errData = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+        throwFromScanErrorPayload(errData, res.status);
       }
 
       const contentType = res.headers.get('content-type') ?? '';
       let responseData: Record<string, unknown>;
       if (contentType.includes('application/x-ndjson')) {
-        responseData = await readNdjsonScanResponse(res, () => setScanStep(2));
+        responseData = await readNdjsonScanResponse(res, {
+          onAnalysis: () => setScanStep(2),
+          onAnalysisData: (analysisData) => {
+            setPricesLoading(true);
+            setIdentifiedItem(
+              buildPartialIdentifiedFromStreamAnalysis(
+                analysisData,
+                scanMode,
+                heroPreviewUrl,
+                buyPrice
+              )
+            );
+            setActiveTab('results');
+          },
+        });
         setScanStep(3);
         await new Promise<void>((r) => setTimeout(r, 280));
         setScanStep(4);
         await new Promise<void>((r) => setTimeout(r, 220));
       } else {
+        setPricesLoading(false);
         responseData = (await res.json()) as Record<string, unknown>;
         setScanStep(2);
         await new Promise<void>((r) => setTimeout(r, 650));
@@ -667,7 +1184,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       // Support both new flat structure and legacy { ai, brand, livePrices } structure
       let result: IdentifiedItem;
       if (responseData.brand_name !== undefined) {
-        result = buildResultFromNewAPI(responseData, buyPrice, scanMode, selectedImage);
+        result = buildResultFromNewAPI(responseData, buyPrice, scanMode, heroPreviewUrl);
         // Always set searchTerm — use edge function query or fall back to brand + product line
         result.searchTerm = ((responseData.searchQuery as string) || '').trim()
           || [result.brand, result.productLine].filter(Boolean).join(' ');
@@ -684,7 +1201,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
           searchQuery?: string;
           scanId?: string;
         };
-        result = buildResultFromAI(ai, brand, buyPrice, scanMode, selectedImage, livePrices);
+        result = buildResultFromAI(ai, brand, buyPrice, scanMode, heroPreviewUrl, livePrices);
         // Always set searchTerm — use edge function query or fall back to brand + item name
         result.searchTerm = (searchQuery || '').trim() || result.brand;
         if (scanId) result.scanId = scanId;
@@ -697,109 +1214,283 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
         undefined;
       if (scanIdFromApi) result.scanId = scanIdFromApi;
 
-      const margin = responseData.margin as AnalyseItemMargin | undefined;
-      if (margin && typeof margin.resale_gbp === 'number') {
-        result = applyAnalyseItemMargin(result, margin, scanMode);
+      const cgForMargin = String(
+        (responseData as { ai?: Record<string, unknown> }).ai?.condition_grade ??
+          result.conditionGrade ??
+          'GOOD'
+      ).toUpperCase();
+      const buyNum = buyPrice ? parseFloat(buyPrice) : 0;
+      const effectiveMargin = buildEffectiveMargin(
+        responseData,
+        cgForMargin,
+        buyNum > 0 ? buyNum : undefined
+      );
+      result = applyAnalyseItemMargin(result, effectiveMargin, scanMode);
+
+      const lpAfter = responseData.livePrices as
+        | {
+            ebay?: { avg?: number; listings?: number; soldCount?: number; scraped?: boolean };
+            vinted?: { avg?: number; listings?: number; scraped?: boolean };
+            depop?: { avg?: number; listings?: number; scraped?: boolean };
+          }
+        | undefined;
+      if (lpAfter) {
+        result = {
+          ...result,
+          platforms: result.platforms.map((p) => {
+            if (p.name === 'eBay' && lpAfter.ebay) {
+              const avg = effectiveMargin.resale_gbp;
+              return {
+                ...p,
+                avgPrice: avg,
+                listings: lpAfter.ebay.listings ?? p.listings,
+                soldListings: lpAfter.ebay.soldCount ?? p.soldListings,
+                scraped: Boolean(lpAfter.ebay.scraped || avg > 0),
+              };
+            }
+            if (p.name === 'Vinted' && lpAfter.vinted?.avg && lpAfter.vinted.avg > 0) {
+              return {
+                ...p,
+                avgPrice: Math.round(lpAfter.vinted.avg),
+                listings: lpAfter.vinted.listings ?? p.listings,
+                scraped: true,
+              };
+            }
+            if (p.name === 'Depop' && lpAfter.depop?.avg && lpAfter.depop.avg > 0) {
+              return {
+                ...p,
+                avgPrice: Math.round(lpAfter.depop.avg),
+                listings: lpAfter.depop.listings ?? p.listings,
+                scraped: true,
+              };
+            }
+            return p;
+          }),
+        };
       }
 
       const fpRaw = (responseData as { fingerprint?: unknown }).fingerprint;
       const fingerprintFromEdge = typeof fpRaw === 'string' && fpRaw.trim() ? fpRaw.trim() : '';
-      result = {
-        ...result,
-        fingerprint: fingerprintFromEdge || clientScanFingerprintFallback(result),
-      };
-
-      setIdentifiedItem(result);
-      setActiveTab('results');
-
-      const persist = (responseData as AnalyseItemCompletePayload).scanPersist;
-      const edgeSaysScanSaved = persist?.ok === true;
-
-      // ── Ensure scans row exists (edge fn uses scanId as PK; anon client fallback) ─
-      const aiFromResponse =
+      const aiNormSource =
         responseData.brand_name !== undefined
           ? (responseData as Record<string, unknown>)
           : (responseData as { ai?: Record<string, unknown> }).ai ?? {};
+      const authMerged = parseAuthenticationFlags(
+        aiNormSource.authentication_flags ?? aiNormSource.authenticationFlags
+      );
+      const cgNorm = String(aiNormSource.condition_grade ?? result.conditionGrade ?? 'GOOD').toUpperCase();
+      const trendUnknown = (responseData as { ebay_price_trend_pct?: unknown }).ebay_price_trend_pct;
+      const ebayTrendPct =
+        typeof trendUnknown === 'number' && Number.isFinite(trendUnknown) ? trendUnknown : null;
+
+      const completeFlip = responseData as AnalyseItemCompletePayload;
+      const flipScore =
+        typeof completeFlip.flip_score === 'number' && Number.isFinite(completeFlip.flip_score)
+          ? completeFlip.flip_score
+          : null;
+      const flipScoreBreakdown =
+        completeFlip.flip_score_breakdown &&
+        typeof completeFlip.flip_score_breakdown === 'object' &&
+        !Array.isArray(completeFlip.flip_score_breakdown)
+          ? (completeFlip.flip_score_breakdown as FlipScoreBreakdownPayload)
+          : null;
+      const svTop = completeFlip.sold_velocity;
+      const soldVelocityFromTop =
+        svTop &&
+        typeof svTop === 'object' &&
+        typeof svTop.d7 === 'number' &&
+        typeof svTop.d30 === 'number'
+          ? { d7: svTop.d7, d30: svTop.d30 }
+          : null;
+      const soldVelocity =
+        soldVelocityFromTop ??
+        (flipScoreBreakdown?.sold_velocity &&
+        typeof flipScoreBreakdown.sold_velocity.d7 === 'number' &&
+        typeof flipScoreBreakdown.sold_velocity.d30 === 'number'
+          ? {
+              d7: flipScoreBreakdown.sold_velocity.d7,
+              d30: flipScoreBreakdown.sold_velocity.d30,
+            }
+          : null);
+      const visionTrendHintRaw = completeFlip.vision_trend_hint;
+      const visionTrendHint =
+        typeof visionTrendHintRaw === 'number' && Number.isFinite(visionTrendHintRaw)
+          ? visionTrendHintRaw
+          : (typeof aiNormSource.trend_score === 'number' ? aiNormSource.trend_score : null);
+
+      const mScore =
+        typeof completeFlip.m_score === 'number' && Number.isFinite(completeFlip.m_score)
+          ? completeFlip.m_score
+          : null;
+      const mScoreBreakdown =
+        completeFlip.m_score_breakdown &&
+        typeof completeFlip.m_score_breakdown === 'object' &&
+        !Array.isArray(completeFlip.m_score_breakdown)
+          ? (completeFlip.m_score_breakdown as Record<string, unknown>)
+          : null;
+
+      const authFromComplete = parseForensicAuthentication(
+        completeFlip.authentication ?? responseData.authentication
+      );
+
+      result = {
+        ...result,
+        fingerprint: fingerprintFromEdge || clientScanFingerprintFallback(result),
+        conditionGrade: cgNorm,
+        authenticationFlags:
+          authMerged.length > 0 ? authMerged : (result.authenticationFlags ?? []),
+        ebayPriceTrendPct: ebayTrendPct ?? result.ebayPriceTrendPct ?? null,
+        flipScore,
+        flipScoreBreakdown,
+        soldVelocity,
+        visionTrendHint,
+        mScore,
+        mScoreBreakdown,
+        forensicAuth: authFromComplete,
+        forensicAuthScore:
+          typeof completeFlip.authentication_score === 'number'
+            ? completeFlip.authentication_score
+            : authFromComplete
+              ? Math.round(authFromComplete.confidence * 100)
+              : null,
+        forensicAuthVerdict:
+          typeof completeFlip.authentication_verdict === 'string'
+            ? completeFlip.authentication_verdict
+            : authFromComplete?.verdict ?? null,
+      };
+
+      result = enrichIdentifiedWithTrust(result, responseData, Date.now());
+
+      const completePayload = responseData as AnalyseItemCompletePayload;
+      const { payload: comparablesParsed, unavailableReason: comparablesReason } =
+        resolveComparablesFromScanPayload(completePayload as Record<string, unknown>);
+      setComparables(comparablesParsed);
+      setComparablesUnavailableReason(comparablesReason);
+      if (comparablesParsed) {
+        result = {
+          ...result,
+          comparables: comparablesParsed,
+          comparablesAveragePrice:
+            typeof completePayload.comparables_average_price === 'number'
+              ? completePayload.comparables_average_price
+              : comparablesParsed.average_price,
+          comparablesOverallConfidence:
+            typeof completePayload.comparables_overall_confidence === 'number'
+              ? completePayload.comparables_overall_confidence
+              : comparablesParsed.overall_confidence,
+        };
+      }
+
+      if (result.pipelineReport) {
+        console.info('[Scan] pipeline_report', {
+          status: result.pipelineReport.pipeline_status,
+          code: result.pipelineReport.primary_code,
+          category: result.pipelineReport.issue_category,
+          stages: result.pipelineReport.stages,
+        });
+      }
+      const previews = mapSoldCompPreviews(responseData.sold_comp_previews, result.scanId ?? '');
+      if (previews.length > 0) {
+        setEbayListings(previews);
+      }
+
+      const shareTok = (responseData as AnalyseItemCompletePayload).share_token;
+      if (typeof shareTok === 'string' && shareTok.trim()) {
+        result = { ...result, shareToken: shareTok.trim() };
+      }
+
+      const economicsPayload =
+        previews.length > 0
+          ? { ...responseData, sold_comp_previews: responseData.sold_comp_previews ?? previews }
+          : responseData;
+      const finalMargin = buildEffectiveMargin(
+        economicsPayload,
+        cgNorm,
+        buyNum > 0 ? buyNum : undefined
+      );
+      result = applyAnalyseItemMargin(result, finalMargin, scanMode);
+      if (isResaleDisplaySuppressed(economicsPayload)) {
+        result = {
+          ...result,
+          insufficientSoldData: true,
+          ebaySoldCompCount:
+            typeof economicsPayload.ebay_sold_comp_count === 'number'
+              ? economicsPayload.ebay_sold_comp_count
+              : result.ebaySoldCompCount,
+          verdict: 'MAYBE',
+        };
+      }
+
+      scanCompleted = true;
+      setIdentifiedItem({ ...result, forensicAuthLoading: !result.forensicAuth });
+      setPricesLoading(false);
+      setActiveTab('results');
+
+      const primaryEncoded = encodedList[0]!;
+      const scanIdForAuth = result.scanId;
+      if (scanIdForAuth && !result.forensicAuth) {
+        forensicAuthScanIdRef.current = scanIdForAuth;
+        void fetchForensicAuthentication({
+          session: scanSession,
+          encoded: primaryEncoded,
+          brandName: result.brand,
+          itemType: result.itemName || result.productLine || '',
+          userId: effectiveUserId,
+          scanId: scanIdForAuth,
+        }).then((authPayload) => {
+          if (!authPayload) {
+            setIdentifiedItem((prev) =>
+              prev && prev.scanId === scanIdForAuth ? { ...prev, forensicAuthLoading: false } : prev
+            );
+            return;
+          }
+          setIdentifiedItem((prev) => {
+            if (!prev || prev.scanId !== scanIdForAuth) return prev;
+            return {
+              ...prev,
+              forensicAuth: authPayload.authentication,
+              forensicAuthScore: authPayload.authentication_score,
+              forensicAuthVerdict: authPayload.authentication_verdict,
+              forensicAuthLoading: false,
+            };
+          });
+        });
+      }
+
+      clearAllStagedPhotos();
+
+      const persist = (responseData as AnalyseItemCompletePayload).scanPersist;
       const persistedImageUrl =
         (responseData as { imageUrl?: string }).imageUrl?.trim() || null;
       const buyPriceNum = buyPrice ? parseFloat(buyPrice) : 0;
 
       if (effectiveUserId && result.scanId) {
-        console.log('[Scan] checking if scan row exists in DB', { scanId: result.scanId });
-
-        const { data: existingRow, error: selectErr } = await supabase
-          .from('scans')
-          .select('id')
-          .eq('id', result.scanId)
-          .maybeSingle();
-
-        if (selectErr) {
-          console.error('[Scan] SELECT check failed:', selectErr);
-        }
-
-        if (existingRow) {
-          console.log('[Scan] scan row already in DB (edge fn wrote it) ✅', result.scanId);
-        } else if (edgeSaysScanSaved) {
-          console.warn(
-            '[Scan] Edge reported scans insert OK but SELECT returned no row — check RLS/policies or wait and refresh history.',
+        const persistOutcome = await ensureScanPersisted({
+          scanId: result.scanId,
+          userId: effectiveUserId,
+          result,
+          responseData,
+          scanMode,
+          buyPriceNum,
+          imageUrl: persistedImageUrl,
+          partnerShopId: partnerShopForBody,
+          edgePersist: persist,
+        });
+        if (!persistOutcome.ok) {
+          const pe = persist?.error;
+          showToast(
+            pe
+              ? `Could not save scan to history (${pe.code}: ${pe.message}). ${persistOutcome.message ?? ''}`
+              : `Could not save scan to history: ${persistOutcome.message ?? persistOutcome.reason}`,
+            'error',
           );
         } else {
-          console.warn('[Scan] scan row NOT in DB — inserting from frontend as fallback');
-          const conditionGrade =
-            typeof aiFromResponse.condition_grade === 'string'
-              ? aiFromResponse.condition_grade
-              : 'GOOD';
-          const resaleVal = result.resaleValue ?? 0;
-          const fallbackRow = {
-            id: result.scanId,
-            user_id: effectiveUserId,
-            brand_name: result.brand,
-            brand_confidence: (aiFromResponse.brand_confidence as number) ?? 0,
-            item_type_bucket: (aiFromResponse.item_type_bucket as string) ?? 'MED',
-            condition_grade: conditionGrade,
-            trend_score: (aiFromResponse.trend_score as number) ?? 5,
-            buy_price_gbp: buyPriceNum || null,
-            expected_resale_gbp: resaleVal,
-            resale_adj_gbp: resaleVal,
-            net_gbp:
-              buyPriceNum > 0
-                ? Math.round(resaleVal - buyPriceNum - resaleVal * 0.12 - 4)
-                : null,
-            profit_gbp:
-              buyPriceNum > 0
-                ? Math.round(resaleVal - buyPriceNum - resaleVal * 0.12 - 4)
-                : null,
-            roi:
-              buyPriceNum > 0
-                ? Math.round(((resaleVal - buyPriceNum) / buyPriceNum) * 100)
-                : null,
-            mode: scanMode.toUpperCase(),
-            platform: 'web',
-            decision: result.verdict ?? 'MAYBE',
-            image_url: persistedImageUrl,
-            ...(partnerShopForBody ? { partner_shop_id: partnerShopForBody } : {}),
-          };
-          const { error: insertErr } = await supabase.from('scans').insert(fallbackRow);
-          if (insertErr) {
-            console.error('[Scan] fallback scans INSERT FAILED:', {
-              code: insertErr.code,
-              message: insertErr.message,
-              details: insertErr.details,
-              hint: insertErr.hint,
-            });
-            const pe = persist?.error;
-            showToast(
-              pe
-                ? `Could not save scan to history (${pe.code}). ${insertErr.message}`
-                : `Could not save scan to history: ${insertErr.message}`,
-              'error',
-            );
-          } else {
-            console.log('[Scan] fallback scans INSERT succeeded ✅', result.scanId);
-          }
+          console.log('[Scan] history row ok', persistOutcome.source, result.scanId);
         }
       } else if (!result.scanId) {
         console.warn('[Scan] no scanId returned from edge function — scan_id FK will be null on save');
+      } else if (!effectiveUserId) {
+        console.warn('[Scan] no user id — scan not saved to history');
       }
       // ─────────────────────────────────────────────────────────────────────
 
@@ -812,11 +1503,13 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       // ─────────────────────────────────────────────────────────────────────
 
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Scan failed. Please try again.';
+      const msg = formatScanErrorForDisplay(err);
+      console.warn('[Scan] failed:', err);
       setError(msg);
+      setPricesLoading(false);
     } finally {
       setIsScanning(false);
-      setScanStep(1);
+      if (!scanCompleted) setScanStep(1);
     }
   };
 
@@ -882,26 +1575,198 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
     );
   };
 
+  const defaultMarkBoughtPriceGbp = (() => {
+    if (buyPrice.trim()) {
+      const n = parseFloat(buyPrice);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    }
+    const pc = identifiedItem?.purchaseCost;
+    if (pc != null && pc > 0) return pc;
+    const bp = outcomeRow?.buy_price_gbp;
+    return bp != null && Number(bp) > 0 ? Number(bp) : null;
+  })();
+
+  const handleWatchPriceResult = async () => {
+    const scanId = identifiedItem?.scanId;
+    if (!scanId) return;
+    const uid = await resolveAuthUserId(user?.id ?? session?.user?.id);
+    if (!uid) {
+      showToast('Sign in to watch resale.', 'error');
+      return;
+    }
+    const baseline = identifiedItem?.resaleValue ?? 0;
+    setWatchPriceBusy(true);
+    const { data, error } = await supabase
+      .from('scan_watchlist')
+      .insert({ user_id: uid, scan_id: scanId, baseline_resale_gbp: baseline })
+      .select('created_at')
+      .maybeSingle();
+    setWatchPriceBusy(false);
+    if (error) {
+      if (error.code === '23505' || (error.message && error.message.toLowerCase().includes('duplicate'))) {
+        showToast('Already watching this scan.', 'info');
+      } else {
+        showToast(error.message, 'error');
+      }
+      return;
+    }
+    setWatchlistActive(true);
+    if (data?.created_at) {
+      setWatchUntilLabel(
+        new Date(watchlistUntilIso(data.created_at as string)).toLocaleString('en-GB', {
+          dateStyle: 'medium',
+          timeStyle: 'short',
+        })
+      );
+    }
+    showToast('Watching resale for 48h from now.', 'success');
+  };
+
+  const handleRemoveComparable = async (listing: ComparableListing) => {
+    if (!comparables) return;
+    const nextRemoved = new Set(removedComparableIds);
+    nextRemoved.add(listing.id);
+    const updated = applyComparableRemoval(comparables, listing.id);
+    setRemovedComparableIds(nextRemoved);
+    setComparables(updated);
+
+    const mRecalc = recalculateMScoreFromComparables(updated, nextRemoved);
+    const avg = updated.average_price;
+
+    setIdentifiedItem((prev) => {
+      if (!prev) return prev;
+      let next: IdentifiedItem = {
+        ...prev,
+        comparables: updated,
+        comparablesAveragePrice: avg,
+        mScore: mRecalc?.score ?? prev.mScore,
+        mScoreBreakdown: mRecalc?.breakdown ?? prev.mScoreBreakdown,
+      };
+      if (avg != null && avg > 0 && !prev.insufficientSoldData) {
+        const platformFees = Math.round(avg * (prev.platformFeeRate ?? PLATFORM_FEE_RATE));
+        const shipping = prev.shippingGbp ?? SHIPPING_GBP;
+        const buffer = prev.marginBufferGbp ?? MARGIN_BUFFER_GBP;
+        const buy = prev.purchaseCost ?? 0;
+        const netProfit = Math.round(avg - buy - platformFees - shipping);
+        next = {
+          ...next,
+          resaleValue: Math.round(avg),
+          netProfit,
+          maxBuyPrice: Math.max(0, Math.round(avg - platformFees - shipping - buffer)),
+          platformFeeGbp: platformFees,
+          platforms: next.platforms.map((p) =>
+            p.name === 'eBay' ? { ...p, avgPrice: Math.round(avg) } : p
+          ),
+        };
+      }
+      return next;
+    });
+
+    void (async () => {
+      const uid = await resolveAuthUserId(user?.id ?? session?.user?.id);
+      if (!uid) return;
+      const { error } = await supabase.from('comparable_removals').insert({
+        item_brand: identifiedItem?.brand ?? '',
+        item_type: identifiedItem?.productLine ?? identifiedItem?.itemName ?? '',
+        removed_listing_title: listing.title,
+        match_score: listing.match_percent / 100,
+        platform: listing.platform,
+        user_id: uid,
+      });
+      if (error) console.warn('[comparable_removals] insert:', error.message);
+    })();
+  };
+
+  const handleMarkBoughtResult = async (price: number | null) => {
+    const scanId = identifiedItem?.scanId;
+    if (!scanId) return;
+    const uid = await resolveAuthUserId(user?.id ?? session?.user?.id);
+    if (!uid) return;
+    const boughtAtIso = new Date().toISOString();
+    const { error } = await supabase
+      .from('scans')
+      .update({ bought_at: boughtAtIso, bought_price_gbp: price })
+      .eq('id', scanId)
+      .eq('user_id', uid);
+    if (error) {
+      showToast(error.message, 'error');
+      return;
+    }
+    setOutcomeRow((prev) => ({
+      bought_at: boughtAtIso,
+      sold_at: prev?.sold_at ?? null,
+      bought_price_gbp: price,
+      buy_price_gbp: prev?.buy_price_gbp ?? null,
+    }));
+    showToast('Marked as bought.', 'success');
+    setBoughtDialogOpen(false);
+  };
+
+  const handleMarkSoldResult = async (soldPrice: number) => {
+    const scanId = identifiedItem?.scanId;
+    if (!scanId) return;
+    const uid = await resolveAuthUserId(user?.id ?? session?.user?.id);
+    if (!uid) return;
+    const soldAtIso = new Date().toISOString();
+    const { error } = await supabase
+      .from('scans')
+      .update({ sold_at: soldAtIso, sold_price_gbp: soldPrice })
+      .eq('id', scanId)
+      .eq('user_id', uid);
+    if (error) {
+      showToast(error.message, 'error');
+      return;
+    }
+    setOutcomeRow((prev) => ({
+      bought_at: prev?.bought_at ?? null,
+      sold_at: soldAtIso,
+      bought_price_gbp: prev?.bought_price_gbp ?? null,
+      buy_price_gbp: prev?.buy_price_gbp ?? null,
+    }));
+    showToast('Sale recorded.', 'success');
+    setSoldDialogOpen(false);
+  };
+
   const showScanCount =
     profile && ['free', 'drop_in', 'scout'].includes(profile.plan ?? 'free');
+
+  const primaryPreview = stagedPhotos[0]?.preview ?? null;
+  const hasStaged = stagedPhotos.length > 0;
 
   // ── EMBEDDED TWO-COLUMN LAYOUT ─────────────────────────────────────────────
   if (embedded) {
     return (
+      <>
       <div className="bg-white rounded-2xl border border-gray-100 p-6 w-full">
         <div className="flex gap-6 w-full">
 
           {/* ── LEFT COLUMN — 45% ── */}
           <div className="w-[45%] flex-shrink-0 flex flex-col gap-4">
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1.5">What you pay in-store (£)</label>
+              <div className="relative">
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm font-medium">£</span>
+                <input
+                  type="number"
+                  value={buyPrice}
+                  onChange={(e) => setBuyPrice(e.target.value)}
+                  placeholder="Enter buy price"
+                  min="0"
+                  step="0.01"
+                  className="w-full pl-7 pr-4 py-3 bg-white border border-gray-200 rounded-lg text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#1a3d2b]/20 focus:border-[#1a3d2b]/40 transition-all"
+                />
+              </div>
+              <p className="text-[10px] text-gray-400 mt-1">Used for net profit — set before you scan.</p>
+            </div>
 
             {/* Upload / Preview area */}
             <div
               onDrop={handleDrop}
               onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
               onDragLeave={() => setDragOver(false)}
-              onClick={() => !selectedImage && fileInputRef.current?.click()}
+              onClick={() => !hasStaged && fileInputRef.current?.click()}
               className={`relative w-full rounded-xl border-2 border-dashed overflow-hidden transition-all cursor-pointer ${
-                selectedImage
+                hasStaged
                   ? 'border-transparent'
                   : dragOver
                   ? 'border-[#1a3d2b] bg-[#1a3d2b]/5'
@@ -909,25 +1774,38 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
               }`}
               style={{ aspectRatio: '4/3' }}
             >
-              {selectedImage ? (
-                <>
-                  <img
-                    src={selectedImage}
-                    alt="Item to scan"
-                    className="w-full h-full object-cover rounded-xl"
-                  />
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setSelectedImage(null);
-                      setSelectedFile(null);
-                      setIdentifiedItem(null);
-                    }}
-                    className="absolute top-2 right-2 w-7 h-7 flex items-center justify-center bg-white/90 backdrop-blur-sm rounded-full hover:bg-white transition-all cursor-pointer"
-                  >
-                    <i className="ri-close-line text-gray-700 text-sm"></i>
-                  </button>
-                </>
+              {hasStaged ? (
+                <div className="absolute inset-0 p-2 grid grid-cols-3 gap-2 bg-white">
+                  {stagedPhotos.map((p) => (
+                    <div key={p.id} className="relative rounded-lg overflow-hidden border border-gray-100 min-h-0">
+                      <img src={p.preview} alt="" className="w-full h-full object-cover" />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeStagedPhoto(p.id);
+                        }}
+                        className="absolute top-1 right-1 w-6 h-6 flex items-center justify-center bg-white/90 rounded-full shadow-sm hover:bg-white cursor-pointer"
+                        aria-label="Remove photo"
+                      >
+                        <i className="ri-close-line text-gray-700 text-xs" />
+                      </button>
+                    </div>
+                  ))}
+                  {stagedPhotos.length < MAX_STAGED_PHOTOS && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        fileInputRef.current?.click();
+                      }}
+                      className="rounded-lg border-2 border-dashed border-gray-200 flex flex-col items-center justify-center gap-1 text-gray-400 hover:border-[#1a3d2b]/40 hover:text-[#1a3d2b] cursor-pointer min-h-0"
+                    >
+                      <i className="ri-add-line text-lg" />
+                      <span className="text-[9px] font-medium">Add</span>
+                    </button>
+                  )}
+                </div>
               ) : (
                 <>
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">
@@ -935,10 +1813,10 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                       <i className="ri-camera-line text-2xl text-gray-400"></i>
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-gray-700">Upload Item Photo</p>
+                      <p className="text-sm font-semibold text-gray-700">Add 1–3 photos</p>
                       <p className="text-xs text-gray-400 mt-1">Drag and drop or click to browse</p>
                     </div>
-                    <p className="text-xs text-gray-300">JPG, PNG, WEBP · Max 10MB</p>
+                    <p className="text-xs text-gray-300">JPG, PNG, WEBP · Max 10MB each</p>
                   </div>
                   {showUploadTip && (
                     <div
@@ -976,14 +1854,22 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
               accept="image/*"
               capture="environment"
               className="hidden"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''; }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) addStagedFiles([f]);
+                e.target.value = '';
+              }}
             />
             <input
               ref={fileInputRef}
               type="file"
               accept="image/*"
+              multiple
               className="hidden"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''; }}
+              onChange={(e) => {
+                if (e.target.files?.length) addStagedFiles(e.target.files);
+                e.target.value = '';
+              }}
             />
 
             {/* Error */}
@@ -994,24 +1880,10 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
               </div>
             )}
 
-            {/* Buy price */}
-            <div className="relative">
-              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm font-medium">£</span>
-              <input
-                type="number"
-                value={buyPrice}
-                onChange={(e) => setBuyPrice(e.target.value)}
-                placeholder="Enter buy price"
-                min="0"
-                step="0.01"
-                className="w-full pl-7 pr-4 py-3 bg-white border border-gray-200 rounded-lg text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#1a3d2b]/20 focus:border-[#1a3d2b]/40 transition-all"
-              />
-            </div>
-
             {/* Scan button */}
             <button
               onClick={handleScan}
-              disabled={!selectedImage || isScanning}
+              disabled={!hasStaged || isScanning}
               className="w-full py-3.5 rounded-lg text-sm font-semibold text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap flex items-center justify-center gap-2"
               style={{ backgroundColor: '#1a3d2b' }}
             >
@@ -1034,7 +1906,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
           <div className="flex-1 min-w-0">
 
             {/* Scanning overlay */}
-            {isScanning && (
+            {isScanning && !identifiedItem && (
               <div className="h-full flex items-center justify-center">
                 <ScanProgress currentStep={scanStep} />
               </div>
@@ -1052,7 +1924,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
             )}
 
             {/* Results */}
-            {!isScanning && identifiedItem && (
+            {identifiedItem && (
               <div className="h-full overflow-y-auto pr-1">
                 <ScanResultCard
                   imageUrl={identifiedItem.imageUrl}
@@ -1076,14 +1948,55 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                   shippingGbp={identifiedItem.shippingGbp}
                   marginBufferGbp={identifiedItem.marginBufferGbp}
                   fingerprint={identifiedItem.fingerprint}
+                  conditionGrade={identifiedItem.conditionGrade}
+                  authenticationFlags={identifiedItem.authenticationFlags}
+                  ebayPriceTrendPct={identifiedItem.ebayPriceTrendPct}
+                  flipScore={identifiedItem.flipScore}
+                  flipScoreBreakdown={identifiedItem.flipScoreBreakdown}
+                  soldVelocity={identifiedItem.soldVelocity}
+                  scanId={identifiedItem.scanId ?? null}
+                  onWatchPrice={handleWatchPriceResult}
+                  watchPriceBusy={watchPriceBusy}
+                  onWatchlist={watchlistActive}
+                  watchUntilLabel={watchUntilLabel}
+                  brandHistoryLine={brandHistoryLine}
+                  boughtAt={outcomeRow?.bought_at ?? null}
+                  soldAt={outcomeRow?.sold_at ?? null}
+                  usedFallbackResale={identifiedItem.usedFallbackResale ?? false}
+                  scrapedAtIso={identifiedItem.scrapedAt ?? null}
+                  priceExtractionMethod={identifiedItem.priceExtractionMethod}
+                  scanReceivedAtMs={identifiedItem.scanReceivedAtMs}
+                  identificationFromCache={identifiedItem.identificationFromCache ?? false}
+                  insufficientSoldData={identifiedItem.insufficientSoldData ?? false}
+                  pipelineSystemWarning={identifiedItem.pipelineSystemWarning ?? null}
+                  ebaySoldCompCount={identifiedItem.ebaySoldCompCount ?? 0}
+                  comparables={comparables}
+                  comparablesAveragePrice={
+                    identifiedItem.comparablesAveragePrice ?? comparables?.average_price ?? null
+                  }
+                  comparablesOverallConfidence={
+                    identifiedItem.comparablesOverallConfidence ??
+                    comparables?.overall_confidence ??
+                    null
+                  }
+                  comparablesUnavailableReason={comparablesUnavailableReason}
+                  removedComparableIds={removedComparableIds}
+                  onRemoveComparable={handleRemoveComparable}
+                  onOpenMarkBought={() => setBoughtDialogOpen(true)}
+                  onOpenMarkSold={() => setSoldDialogOpen(true)}
+                  pricesLoading={pricesLoading}
+                  forensicAuth={identifiedItem.forensicAuth}
+                  forensicAuthScore={identifiedItem.forensicAuthScore}
+                  forensicAuthLoading={identifiedItem.forensicAuthLoading}
                   onSave={() => handleSaveItem(identifiedItem)}
-                  onRescan={() => {
-                    setSelectedImage(null);
-                    setSelectedFile(null);
-                    setBuyPrice('');
-                    setIdentifiedItem(null);
-                    setEbayListings([]);
-                  }}
+                  sizeLabel={identifiedItem.sizeLabel}
+                  shareUrl={
+                    identifiedItem.shareToken && typeof window !== 'undefined'
+                      ? `${window.location.origin}/share/scan/${identifiedItem.shareToken}`
+                      : null
+                  }
+                  onShareMessage={(m, v) => showToast(m, v)}
+                  onRescan={prepareNewPhotoCapture}
                 />
               </div>
             )}
@@ -1091,11 +2004,25 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
           </div>
         </div>
       </div>
+      <MarkBoughtDialog
+        open={boughtDialogOpen}
+        defaultPriceGbp={defaultMarkBoughtPriceGbp}
+        onClose={() => setBoughtDialogOpen(false)}
+        onConfirm={handleMarkBoughtResult}
+      />
+      <MarkSoldDialog
+        open={soldDialogOpen}
+        brandName={identifiedItem?.brand}
+        onClose={() => setSoldDialogOpen(false)}
+        onConfirm={handleMarkSoldResult}
+      />
+      </>
     );
   }
   // ── END EMBEDDED LAYOUT ─────────────────────────────────────────────────────
 
   return (
+    <>
     <div className={embedded ? 'flex flex-col' : 'min-h-screen bg-gray-50 flex flex-col'}>
       {/* Top Bar */}
       <header className={`bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between${embedded ? ' hidden' : ''}`}>
@@ -1215,7 +2142,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       <main className="flex-1 flex flex-col items-center justify-start py-10 px-4">
 
         {/* ── SCANNING OVERLAY ── */}
-        {isScanning && (
+        {isScanning && !identifiedItem && (
           <div className="w-full flex flex-col items-center justify-center py-8">
             <ScanProgress currentStep={scanStep} />
           </div>
@@ -1224,32 +2151,79 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
         {/* ── SCAN TAB ── */}
         {activeTab === 'scan' && !isScanning && (
           <div className="w-full max-w-md">
-            <div className="text-center mb-8">
+            <div className="text-center mb-6">
               <h2 className="text-2xl font-bold text-gray-900 mb-1">Scan an Item</h2>
-              <p className="text-sm text-gray-500">Upload a photo to get instant resale insights</p>
+              <p className="text-sm text-gray-500">Add up to three angles for clearer IDs and size reads</p>
             </div>
 
-            {/* Upload Area */}
-            {selectedImage ? (
-              <div className="relative w-full aspect-square rounded-2xl border-2 border-transparent overflow-hidden mb-5">
-                <img src={selectedImage} alt="Item to scan" className="w-full h-full object-cover" />
-                <div className="absolute inset-0 bg-black/0 hover:bg-black/20 transition-all flex items-center justify-center">
-                  <span className="opacity-0 hover:opacity-100 text-white text-sm font-medium bg-black/60 px-3 py-1.5 rounded-full transition-all">
-                    Change photo
-                  </span>
+            <div className="mb-5 rounded-2xl border-2 border-gray-900/10 bg-white px-4 py-4 shadow-sm">
+              <label className="block text-sm font-bold text-gray-900 mb-2">What are you paying for this piece? (£)</label>
+              <div className="relative">
+                <span className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500 font-semibold text-sm">£</span>
+                <input
+                  type="number"
+                  value={buyPrice}
+                  onChange={(e) => setBuyPrice(e.target.value)}
+                  placeholder="0.00"
+                  min="0"
+                  step="0.01"
+                  className="w-full pl-9 pr-4 py-3.5 bg-gray-50 border border-gray-200 rounded-xl text-base text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-black/15 focus:border-gray-400 transition-all"
+                />
+              </div>
+              <p className="text-xs text-gray-500 mt-2 leading-snug">
+                Enter your buy price <span className="font-semibold text-gray-800">before</span> you run the scan so net profit and verdict match what you pay in-store or at the rail.
+              </p>
+            </div>
+
+            {/* Mode Selector */}
+            <div className="mb-5">
+              <label className="block text-sm font-semibold text-gray-700 mb-3">Scan Mode</label>
+              <div className="grid grid-cols-3 gap-2">
+                {(Object.keys(MODE_CONFIG) as ScanMode[]).map((mode) => (
+                  <button
+                    key={mode}
+                    onClick={() => setScanMode(mode)}
+                    className={`flex flex-col items-center gap-1 px-3 py-3 rounded-xl border-2 transition-all cursor-pointer ${
+                      scanMode === mode
+                        ? MODE_CONFIG[mode].active
+                        : 'border-gray-200 bg-white text-gray-500 hover:border-gray-300'
+                    }`}
+                  >
+                    <span className="text-sm font-semibold">{mode}</span>
+                    <span className="text-[10px] leading-tight text-center opacity-70">{MODE_CONFIG[mode].desc}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Photos */}
+            {hasStaged ? (
+              <div className="relative w-full aspect-square rounded-2xl border-2 border-gray-200 overflow-hidden mb-5 bg-white">
+                <div className="absolute inset-0 p-3 grid grid-cols-3 gap-2">
+                  {stagedPhotos.map((p) => (
+                    <div key={p.id} className="relative rounded-xl overflow-hidden border border-gray-100 min-h-0">
+                      <img src={p.preview} alt="" className="w-full h-full object-cover" />
+                      <button
+                        type="button"
+                        onClick={() => removeStagedPhoto(p.id)}
+                        className="absolute top-2 right-2 w-8 h-8 flex items-center justify-center bg-white/90 rounded-full shadow-md hover:bg-white cursor-pointer"
+                        aria-label="Remove photo"
+                      >
+                        <i className="ri-close-line text-gray-800" />
+                      </button>
+                    </div>
+                  ))}
+                  {stagedPhotos.length < MAX_STAGED_PHOTOS && (
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="rounded-xl border-2 border-dashed border-gray-300 flex flex-col items-center justify-center gap-1 text-gray-500 hover:border-black hover:text-black cursor-pointer min-h-0"
+                    >
+                      <i className="ri-add-line text-2xl" />
+                      <span className="text-xs font-semibold">Add angle</span>
+                    </button>
+                  )}
                 </div>
-                <div className="absolute top-3 right-3 w-8 h-8 flex items-center justify-center bg-emerald-500 rounded-full shadow-md">
-                  <i className="ri-check-line text-white text-base"></i>
-                </div>
-                <button
-                  onClick={() => {
-                    setSelectedImage(null);
-                    setSelectedFile(null);
-                  }}
-                  className="absolute top-3 left-3 w-8 h-8 flex items-center justify-center bg-white/90 backdrop-blur-sm rounded-full shadow-md hover:bg-white transition-all cursor-pointer"
-                >
-                  <i className="ri-close-line text-gray-700 text-base"></i>
-                </button>
               </div>
             ) : (
               <div
@@ -1257,9 +2231,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                 onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
                 onDragLeave={() => setDragOver(false)}
                 className={`relative w-full rounded-2xl border-2 border-dashed transition-all overflow-hidden mb-5 p-8 ${
-                  dragOver
-                    ? 'border-black bg-gray-100'
-                    : 'border-gray-300 bg-white'
+                  dragOver ? 'border-black bg-gray-100' : 'border-gray-300 bg-white'
                 }`}
               >
                 <div className="flex flex-col items-center gap-4 text-center">
@@ -1267,13 +2239,12 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                     <i className="ri-camera-line text-3xl text-gray-400"></i>
                   </div>
                   <div>
-                    <p className="text-sm font-semibold text-gray-700 mb-1">Choose how to add a photo</p>
+                    <p className="text-sm font-semibold text-gray-700 mb-1">Add 1–3 photos</p>
                     <p className="text-xs text-gray-400">or drag and drop here</p>
                   </div>
-
-                  {/* Two buttons */}
                   <div className="w-full space-y-3 mt-2">
                     <button
+                      type="button"
                       onClick={() => cameraInputRef.current?.click()}
                       className="w-full flex items-center justify-center gap-2 bg-black text-white py-3.5 rounded-xl text-sm font-semibold hover:bg-gray-900 transition-all cursor-pointer whitespace-nowrap"
                     >
@@ -1281,6 +2252,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                       Take photo with camera
                     </button>
                     <button
+                      type="button"
                       onClick={() => fileInputRef.current?.click()}
                       className="w-full flex items-center justify-center gap-2 bg-white border-2 border-gray-200 text-gray-700 py-3.5 rounded-xl text-sm font-semibold hover:border-gray-300 hover:bg-gray-50 transition-all cursor-pointer whitespace-nowrap"
                     >
@@ -1288,8 +2260,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                       Upload from camera roll
                     </button>
                   </div>
-
-                  <p className="text-xs text-gray-400 mt-2">JPG, PNG, WEBP · Max 10MB</p>
+                  <p className="text-xs text-gray-400 mt-2">JPG, PNG, WEBP · Max 10MB each</p>
                 </div>
                 {showUploadTip && (
                   <div className="absolute bottom-3 left-3 right-3 z-10 rounded-xl border border-black/10 bg-white shadow-lg p-3 flex gap-2 items-start text-left">
@@ -1312,21 +2283,28 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
               </div>
             )}
 
-            {/* Hidden file inputs */}
             <input
               ref={cameraInputRef}
               type="file"
               accept="image/*"
               capture="environment"
               className="hidden"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''; }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) addStagedFiles([f]);
+                e.target.value = '';
+              }}
             />
             <input
               ref={fileInputRef}
               type="file"
               accept="image/*"
+              multiple
               className="hidden"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''; }}
+              onChange={(e) => {
+                if (e.target.files?.length) addStagedFiles(e.target.files);
+                e.target.value = '';
+              }}
             />
 
             {error && (
@@ -1336,49 +2314,9 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
               </div>
             )}
 
-            {/* Buy Price */}
-            <div className="mb-5">
-              <label className="block text-sm font-semibold text-gray-700 mb-2">Buy Price</label>
-              <div className="relative">
-                <span className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500 font-medium text-sm">£</span>
-                <input
-                  type="number"
-                  value={buyPrice}
-                  onChange={(e) => setBuyPrice(e.target.value)}
-                  placeholder="0.00"
-                  min="0"
-                  step="0.01"
-                  className="w-full pl-8 pr-4 py-3.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-black/10 focus:border-gray-400 transition-all"
-                />
-              </div>
-              <p className="text-xs text-gray-400 mt-1.5">Enter what you paid or plan to pay</p>
-            </div>
-
-            {/* Mode Selector */}
-            <div className="mb-7">
-              <label className="block text-sm font-semibold text-gray-700 mb-3">Scan Mode</label>
-              <div className="grid grid-cols-3 gap-2">
-                {(Object.keys(MODE_CONFIG) as ScanMode[]).map((mode) => (
-                  <button
-                    key={mode}
-                    onClick={() => setScanMode(mode)}
-                    className={`flex flex-col items-center gap-1 px-3 py-3 rounded-xl border-2 transition-all cursor-pointer ${
-                      scanMode === mode
-                        ? MODE_CONFIG[mode].active
-                        : 'border-gray-200 bg-white text-gray-500 hover:border-gray-300'
-                    }`}
-                  >
-                    <span className="text-sm font-semibold">{mode}</span>
-                    <span className="text-[10px] leading-tight text-center opacity-70">{MODE_CONFIG[mode].desc}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Scan Button */}
             <button
               onClick={handleScan}
-              disabled={!selectedImage || isScanning}
+              disabled={!hasStaged || isScanning}
               className="w-full bg-black text-white py-4 rounded-2xl text-base font-semibold hover:bg-gray-900 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap cursor-pointer flex items-center justify-center gap-2 shadow-lg shadow-black/10"
             >
               <i className="ri-scan-2-line text-lg"></i>
@@ -1392,7 +2330,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
         )}
 
         {/* ── RESULTS TAB ── */}
-        {activeTab === 'results' && !isScanning && (
+        {activeTab === 'results' && (!isScanning || identifiedItem) && (
           <div className="w-full flex flex-col items-center gap-6">
             {identifiedItem ? (
               <>
@@ -1453,14 +2391,56 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                   shippingGbp={identifiedItem.shippingGbp}
                   marginBufferGbp={identifiedItem.marginBufferGbp}
                   fingerprint={identifiedItem.fingerprint}
+                  conditionGrade={identifiedItem.conditionGrade}
+                  authenticationFlags={identifiedItem.authenticationFlags}
+                  ebayPriceTrendPct={identifiedItem.ebayPriceTrendPct}
+                  flipScore={identifiedItem.flipScore}
+                  flipScoreBreakdown={identifiedItem.flipScoreBreakdown}
+                  soldVelocity={identifiedItem.soldVelocity}
+                  scanId={identifiedItem.scanId ?? null}
+                  onWatchPrice={handleWatchPriceResult}
+                  watchPriceBusy={watchPriceBusy}
+                  onWatchlist={watchlistActive}
+                  watchUntilLabel={watchUntilLabel}
+                  brandHistoryLine={brandHistoryLine}
+                  boughtAt={outcomeRow?.bought_at ?? null}
+                  soldAt={outcomeRow?.sold_at ?? null}
+                  usedFallbackResale={identifiedItem.usedFallbackResale ?? false}
+                  scrapedAtIso={identifiedItem.scrapedAt ?? null}
+                  priceExtractionMethod={identifiedItem.priceExtractionMethod}
+                  scanReceivedAtMs={identifiedItem.scanReceivedAtMs}
+                  identificationFromCache={identifiedItem.identificationFromCache ?? false}
+                  insufficientSoldData={identifiedItem.insufficientSoldData ?? false}
+                  pipelineSystemWarning={identifiedItem.pipelineSystemWarning ?? null}
+                  ebaySoldCompCount={identifiedItem.ebaySoldCompCount ?? 0}
+                  comparables={comparables}
+                  comparablesAveragePrice={
+                    identifiedItem.comparablesAveragePrice ?? comparables?.average_price ?? null
+                  }
+                  comparablesOverallConfidence={
+                    identifiedItem.comparablesOverallConfidence ??
+                    comparables?.overall_confidence ??
+                    null
+                  }
+                  comparablesUnavailableReason={comparablesUnavailableReason}
+                  removedComparableIds={removedComparableIds}
+                  onRemoveComparable={handleRemoveComparable}
+                  onOpenMarkBought={() => setBoughtDialogOpen(true)}
+                  onOpenMarkSold={() => setSoldDialogOpen(true)}
+                  pricesLoading={pricesLoading}
+                  forensicAuth={identifiedItem.forensicAuth}
+                  forensicAuthScore={identifiedItem.forensicAuthScore}
+                  forensicAuthLoading={identifiedItem.forensicAuthLoading}
                   onSave={() => handleSaveItem(identifiedItem)}
+                  sizeLabel={identifiedItem.sizeLabel}
+                  shareUrl={
+                    identifiedItem.shareToken && typeof window !== 'undefined'
+                      ? `${window.location.origin}/share/scan/${identifiedItem.shareToken}`
+                      : null
+                  }
+                  onShareMessage={(m, v) => showToast(m, v)}
                   onRescan={() => {
-                    setSelectedImage(null);
-                    setSelectedFile(null);
-                    setBuyPrice('');
-                    setIdentifiedItem(null);
-                    setEbayListings([]);
-                    setActiveTab('scan');
+                    prepareNewPhotoCapture();
                   }}
                 />
               </>
@@ -1497,5 +2477,18 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
         )}
       </main>
     </div>
+    <MarkBoughtDialog
+      open={boughtDialogOpen}
+      defaultPriceGbp={defaultMarkBoughtPriceGbp}
+      onClose={() => setBoughtDialogOpen(false)}
+      onConfirm={handleMarkBoughtResult}
+    />
+    <MarkSoldDialog
+      open={soldDialogOpen}
+      brandName={identifiedItem?.brand}
+      onClose={() => setSoldDialogOpen(false)}
+      onConfirm={handleMarkSoldResult}
+    />
+    </>
   );
 }
