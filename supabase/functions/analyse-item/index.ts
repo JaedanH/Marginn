@@ -14,40 +14,40 @@ import {
   isIdentificationPayloadUsable,
   mergeIdentificationFromCache,
   pickIdentificationPayload,
-} from "../_shared/identificationCache.ts";
-import { browserPreflightResponse, corsHeadersForRequest, jsonResponse } from "../_shared/cors.ts";
-import { pickBody } from "../_shared/sanitizeBody.ts";
-import { validateScanImageInput, type ValidatedScanImage } from "../_shared/imageValidation.ts";
-import { enforceUserRateLimit, RATE_LIMIT_SLUG_ANALYSE_ITEM } from "../_shared/rateLimit.ts";
-import { withRequestLog, type RequestLogHandle } from "../_shared/requestLog.ts";
-import { recordScanFailureStreak } from "../_shared/scanFailureStreak.ts";
-import { calculateFlipScore, resolveSoldVelocity } from "../_shared/flipScore.ts";
-import { calculateMScore, mScoreTierFromBrandRow } from "../_shared/calculateMScore.ts";
+} from "./_shared/identificationCache.ts";
+import { browserPreflightResponse, corsHeadersForRequest, jsonResponse } from "./_shared/cors.ts";
+import { pickBody } from "./_shared/sanitizeBody.ts";
+import { validateScanImageInput, type ValidatedScanImage } from "./_shared/imageValidation.ts";
+import { enforceUserRateLimit, RATE_LIMIT_SLUG_ANALYSE_ITEM } from "./_shared/rateLimit.ts";
+import { withRequestLog, type RequestLogHandle } from "./_shared/requestLog.ts";
+import { recordScanFailureStreak } from "./_shared/scanFailureStreak.ts";
+import { calculateFlipScore, resolveSoldVelocity } from "./_shared/flipScore.ts";
+import { calculateMScore, mScoreTierFromBrandRow } from "./_shared/calculateMScore.ts";
 import {
   MIN_EBAY_SOLD_COMPS_FOR_DISPLAY,
   resolveEbayCompCount,
   shouldSuppressResaleDisplay,
-} from "../_shared/ebayCompsTrust.ts";
-import { deriveMarketPrices, extractPlatformMarketData } from "../_shared/marketVisionScrape.ts";
+} from "./_shared/ebayCompsTrust.ts";
+import { deriveMarketPrices, extractPlatformMarketData } from "./_shared/marketVisionScrape.ts";
 import {
   collectComparableDiscards,
   findBestComparables,
   type FindBestComparablesResult,
-} from "../_shared/findBestComparables.ts";
+} from "./_shared/findBestComparables.ts";
 import {
   anthropicKey,
   ebayAppIdDiag,
   imgbbKey,
   logEdgeSecretsAtStartup,
   scrapingBeeKeyDiag,
-} from "../_shared/edgeSecrets.ts";
+} from "./_shared/edgeSecrets.ts";
 import {
   buildCompletePipelineReport,
   buildFailedReport,
   E,
   pipelineErrorFromStatus,
   pipelineJsonError,
-} from "../_shared/pipelineDiagnostics.ts";
+} from "./_shared/pipelineDiagnostics.ts";
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 
@@ -711,31 +711,6 @@ async function finishScanAfterVision(args: FinishScanArgs): Promise<Record<strin
     );
   }
 
-  if (
-    comparablesResult &&
-    comparablesResult.ebay.top5.length === 0 &&
-    comparablesResult.vinted.top5.length === 0 &&
-    comparablesResult.depop.top5.length === 0 &&
-    ebayM.listings.length > 0
-  ) {
-    comparablesResult = findBestComparables(
-      {
-        brand: "unknown",
-        type: itemTypeForRelevance || "unknown",
-        colour: "",
-        condition: condGradeEarly,
-        size: "",
-      },
-      ebayM.listings,
-      vintedM.listings,
-      depopM.listings,
-    );
-    console.warn(
-      "[findBestComparables] relaxed brand fallback",
-      JSON.stringify({ ebay_top5: comparablesResult.ebay.top5.length }),
-    );
-  }
-
   const ebayPrices = platformPricesFromResult(ebayM.prices, ebayM.listings);
   const vintedPrices = platformPricesFromResult(vintedM.prices, vintedM.listings);
   const depopPrices = platformPricesFromResult(depopM.prices, depopM.listings);
@@ -1084,7 +1059,7 @@ async function finishScanAfterVision(args: FinishScanArgs): Promise<Record<strin
 
   const scrapedAt = new Date().toISOString();
   const usedFallbackResale = insufficientSoldData || !useEbayResale;
-  const soldCompPreviews = ebayListingCards.slice(0, 12).map((l, i) => ({
+  const soldCompPreviews = ebayListingCards.slice(0, 3).map((l, i) => ({
     id: `edge-preview-${scanId.slice(0, 8)}-${i}`,
     scan_id: scanId,
     platform: "ebay",
