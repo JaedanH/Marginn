@@ -6,6 +6,7 @@ import {
   PLATFORM_FEE_RATE,
   SHIPPING_GBP,
 } from './scanEconomics';
+import type { ComparablesPayload } from './findBestComparables';
 import {
   ScanPipelineError,
   type PipelineReport,
@@ -76,6 +77,10 @@ export interface AnalyseItemCompletePayload {
   pipeline_report?: PipelineReport;
   pipeline_primary_code?: string | null;
   pipeline_issue_category?: 'none' | 'user' | 'system';
+  /** AI comparable finder output (top 5 per platform + all 70%+ matches). */
+  comparables?: ComparablesPayload | Record<string, unknown> | null;
+  comparables_average_price?: number | null;
+  comparables_overall_confidence?: number | null;
 }
 
 function medianPositive(prices: number[]): number {
@@ -119,6 +124,18 @@ export function coalesceResaleGbp(
   const flat = data.resale_price;
   if (typeof flat === 'number' && Number.isFinite(flat) && flat > 0) {
     return Math.round(flat);
+  }
+
+  const ebayAvgSold = data.ebay_average_sold_price;
+  const compCount = data.ebay_sold_comp_count;
+  if (
+    typeof ebayAvgSold === 'number' &&
+    Number.isFinite(ebayAvgSold) &&
+    ebayAvgSold > 0 &&
+    typeof compCount === 'number' &&
+    compCount >= MIN_EBAY_SOLD_COMPS_FOR_DISPLAY
+  ) {
+    return Math.round(ebayAvgSold);
   }
 
   const lp = data.livePrices as

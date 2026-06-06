@@ -25,12 +25,14 @@ Unzip it on a second monitor. For each file, open the same path in **Readdy → 
 
 | Path | Why |
 |------|-----|
-| `src/lib/scanEdgeResponse.ts` | `finding_api`, pipeline types, NDJSON errors |
+| `src/lib/scanEdgeResponse.ts` | `finding_api`, pipeline types, comparables fields, NDJSON errors |
+| `src/lib/findBestComparables.ts` | **NEW** — comparable items parse, removal, recalc helpers |
+| `src/lib/calculateMScore.ts` | **NEW** — M-Score recalc after removing a comparable |
 | `src/lib/pipelineDiagnostics.ts` | **NEW** — E-/U- codes, scan error messages |
 | `src/lib/ensureScanPersisted.ts` | **NEW** — scan history saved to `scans` table |
 | `src/lib/authUserId.ts` | **NEW** if missing — correct `user_id` for history queries |
-| `src/pages/scan/page.tsx` | Scan persist, pipeline errors, trust fields |
-| `src/pages/scan/components/ScanResultCard.tsx` | Manual browse, `finding_api` label, system warnings |
+| `src/pages/scan/page.tsx` | Scan persist, pipeline errors, trust fields, comparables removal/recalc |
+| `src/pages/scan/components/ScanResultCard.tsx` | Manual browse, comparables section, system warnings |
 | `src/pages/dashboard/components/NewScanSection.tsx` | Pipeline error display |
 | `src/pages/dashboard/page.tsx` | History refresh after scan (`marginn:scan-saved`) |
 | `src/pages/dashboard/history/page.tsx` | History refresh + load error toast |
@@ -82,7 +84,17 @@ Readdy hosts the **frontend only**. Run on your PC (Supabase CLI linked to proje
 cd d:\Marginn\project
 supabase db push
 supabase functions deploy analyse-item
+supabase functions deploy build-whitelist
 ```
+
+**Edge secrets** (Supabase Dashboard → Edge Functions → Secrets):
+
+| Secret | Purpose |
+|--------|---------|
+| `EBAY_APP_ID` | eBay Finding API (sold comps — **not** ScrapingBee) |
+| `SCRAPINGBEE_API_KEY` | Vinted + Depop only |
+| `ANTHROPIC_API_KEY` | Vision identification |
+| `SUPABASE_SERVICE_ROLE_KEY` | Scan history insert + rate limits |
 
 Apply these SQL files if you don’t use CLI (Dashboard → SQL Editor, in order):
 
@@ -90,7 +102,7 @@ Apply these SQL files if you don’t use CLI (Dashboard → SQL Editor, in order
 2. `supabase/migrations/20260514120100_scans_flip_score.sql`
 3. `supabase/migrations/20260528120000_scans_share_token.sql`
 
-Edge file to deploy (not in Readdy): `supabase/functions/analyse-item/index.ts` + `supabase/functions/_shared/flipScore.ts` + `identificationCache.ts`.
+Edge deploy from this repo (not in Readdy paste): `analyse-item` plus `_shared/ebayFindingApi.ts`, `marketVisionScrape.ts`, `pipelineDiagnostics.ts`, `edgeSecrets.ts`, `ebayCompsTrust.ts`, `flipScore.ts`, `identificationCache.ts`.
 
 Set **`EDGE_EXTRA_ALLOWED_ORIGINS`** in Supabase to your Readdy preview URL and production domain.
 

@@ -110,6 +110,19 @@ export function isUserLimitedDataReport(report: PipelineReport | null): boolean 
 
 export function formatScanErrorForDisplay(err: unknown): string {
   if (err instanceof ScanPipelineError) return err.message;
-  if (err instanceof Error && err.message.trim()) return err.message;
+  if (err instanceof Error && err.message.trim()) {
+    const m = err.message.trim();
+    if (/failed to fetch/i.test(m) || /networkerror/i.test(m)) {
+      return (
+        'Could not reach the scan server (network or CORS). If you are on a Readdy preview URL, ' +
+        'redeploy analyse-item after the latest CORS update, or add your site origin to Supabase ' +
+        'secret EDGE_EXTRA_ALLOWED_ORIGINS.'
+      );
+    }
+    if (/^unknown$/i.test(m) || /^unknown pipeline/i.test(m)) {
+      return 'Scan failed. Please try again.';
+    }
+    return m;
+  }
   return 'Scan failed. Please try again.';
 }

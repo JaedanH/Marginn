@@ -36,15 +36,18 @@ import { resolveAuthUserId } from '../../lib/authUserId';
 import { countPeersSameBrand, formatBrandHistoryLine } from '../../lib/scanBrandAggregates';
 import { watchlistUntilIso } from '../../lib/watchlistConstants';
 import { MarkBoughtDialog, MarkSoldDialog } from '../dashboard/history/components/ScanOutcomeDialogs';
-import PreScanChecklist, {
-  getPrescanChecklistInitiallyVisible,
-  markPrescanSessionScanSuccess,
-} from './components/PreScanChecklist';
 import {
   fetchForensicAuthentication,
   parseForensicAuthentication,
   type ForensicAuthentication,
 } from '../../lib/forensicAuthentication';
+import {
+  applyComparableRemoval,
+  resolveComparablesFromScanPayload,
+  recalculateMScoreFromComparables,
+  type ComparableListing,
+  type ComparablesPayload,
+} from '../../lib/findBestComparables';
 
 const STRIPE_SUCCESS_URL = supabaseFunctionUrl('stripe-success');
 const EDGE_FN_URL = supabaseFunctionUrl('analyse-item');
@@ -135,6 +138,10 @@ export interface IdentifiedItem {
   pipelineReport?: PipelineReport | null;
   /** System-side partial failure message (E-*), when scan still completes. */
   pipelineSystemWarning?: string | null;
+  comparables?: ComparablesPayload | null;
+  comparablesAveragePrice?: number | null;
+  comparablesOverallConfidence?: number | null;
+  comparablesUnavailableReason?: string | null;
 }
 
 type ScanMode = 'Safe' | 'Standard' | 'Aggressive';
@@ -190,7 +197,7 @@ function clientScanFingerprintFallback(item: IdentifiedItem): string {
 
 function mapSoldCompPreviews(raw: unknown, scanId: string): ListingCacheRow[] {
   if (!Array.isArray(raw) || !scanId) return [];
-  return raw.slice(0, 3).map((row, i) => {
+  return raw.slice(0, 12).map((row, i) => {
     const r = row as Record<string, unknown>;
     const price = r.price_gbp;
     return {
@@ -778,7 +785,6 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
   const [savedItems, setSavedItems] = useState<IdentifiedItem[]>([]);
   const [boughtItems, setBoughtItems] = useState<BoughtItem[]>(MOCK_BOUGHT_ITEMS);
   const [stagedPhotos, setStagedPhotos] = useState<StagedPhoto[]>([]);
-  const [prescanVisible, setPrescanVisible] = useState(getPrescanChecklistInitiallyVisible);
   const [buyPrice, setBuyPrice] = useState('');
   const [scanMode, setScanMode] = useState<ScanMode>('Standard');
   const [isScanning, setIsScanning] = useState(false);
@@ -787,6 +793,11 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
   const [scanStep, setScanStep] = useState(1);
   const [brandsCount, setBrandsCount] = useState<number | null>(null);
   const [ebayListings, setEbayListings] = useState<ListingCacheRow[]>([]);
+  const [comparables, setComparables] = useState<ComparablesPayload | null>(null);
+  const [comparablesUnavailableReason, setComparablesUnavailableReason] = useState<string | null>(
+    null
+  );
+  const [removedComparableIds, setRemovedComparableIds] = useState<Set<string>>(() => new Set());
   const [flagsOpen, setFlagsOpen] = useState(false);
   /** True after `analysis` NDJSON event until full merge from `complete`. */
   const [pricesLoading, setPricesLoading] = useState(false);
@@ -1071,6 +1082,9 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
     setError(null);
     setScanStep(1);
     setEbayListings([]);
+    setComparables(null);
+    setComparablesUnavailableReason(null);
+    setRemovedComparableIds(new Set());
     setPricesLoading(true);
 
     let scanCompleted = false;
@@ -1346,6 +1360,27 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       };
 
       result = enrichIdentifiedWithTrust(result, responseData, Date.now());
+
+      const completePayload = responseData as AnalyseItemCompletePayload;
+      const { payload: comparablesParsed, unavailableReason: comparablesReason } =
+        resolveComparablesFromScanPayload(completePayload as Record<string, unknown>);
+      setComparables(comparablesParsed);
+      setComparablesUnavailableReason(comparablesReason);
+      if (comparablesParsed) {
+        result = {
+          ...result,
+          comparables: comparablesParsed,
+          comparablesAveragePrice:
+            typeof completePayload.comparables_average_price === 'number'
+              ? completePayload.comparables_average_price
+              : comparablesParsed.average_price,
+          comparablesOverallConfidence:
+            typeof completePayload.comparables_overall_confidence === 'number'
+              ? completePayload.comparables_overall_confidence
+              : comparablesParsed.overall_confidence,
+        };
+      }
+
       if (result.pipelineReport) {
         console.info('[Scan] pipeline_report', {
           status: result.pipelineReport.pipeline_status,
@@ -1390,8 +1425,6 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       setIdentifiedItem({ ...result, forensicAuthLoading: !result.forensicAuth });
       setPricesLoading(false);
       setActiveTab('results');
-      markPrescanSessionScanSuccess();
-      setPrescanVisible(false);
 
       const primaryEncoded = encodedList[0]!;
       const scanIdForAuth = result.scanId;
@@ -1589,6 +1622,61 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
     showToast('Watching resale for 48h from now.', 'success');
   };
 
+  const handleRemoveComparable = async (listing: ComparableListing) => {
+    if (!comparables) return;
+    const nextRemoved = new Set(removedComparableIds);
+    nextRemoved.add(listing.id);
+    const updated = applyComparableRemoval(comparables, listing.id);
+    setRemovedComparableIds(nextRemoved);
+    setComparables(updated);
+
+    const mRecalc = recalculateMScoreFromComparables(updated, nextRemoved);
+    const avg = updated.average_price;
+
+    setIdentifiedItem((prev) => {
+      if (!prev) return prev;
+      let next: IdentifiedItem = {
+        ...prev,
+        comparables: updated,
+        comparablesAveragePrice: avg,
+        mScore: mRecalc?.score ?? prev.mScore,
+        mScoreBreakdown: mRecalc?.breakdown ?? prev.mScoreBreakdown,
+      };
+      if (avg != null && avg > 0 && !prev.insufficientSoldData) {
+        const platformFees = Math.round(avg * (prev.platformFeeRate ?? PLATFORM_FEE_RATE));
+        const shipping = prev.shippingGbp ?? SHIPPING_GBP;
+        const buffer = prev.marginBufferGbp ?? MARGIN_BUFFER_GBP;
+        const buy = prev.purchaseCost ?? 0;
+        const netProfit = Math.round(avg - buy - platformFees - shipping);
+        next = {
+          ...next,
+          resaleValue: Math.round(avg),
+          netProfit,
+          maxBuyPrice: Math.max(0, Math.round(avg - platformFees - shipping - buffer)),
+          platformFeeGbp: platformFees,
+          platforms: next.platforms.map((p) =>
+            p.name === 'eBay' ? { ...p, avgPrice: Math.round(avg) } : p
+          ),
+        };
+      }
+      return next;
+    });
+
+    void (async () => {
+      const uid = await resolveAuthUserId(user?.id ?? session?.user?.id);
+      if (!uid) return;
+      const { error } = await supabase.from('comparable_removals').insert({
+        item_brand: identifiedItem?.brand ?? '',
+        item_type: identifiedItem?.productLine ?? identifiedItem?.itemName ?? '',
+        removed_listing_title: listing.title,
+        match_score: listing.match_percent / 100,
+        platform: listing.platform,
+        user_id: uid,
+      });
+      if (error) console.warn('[comparable_removals] insert:', error.message);
+    })();
+  };
+
   const handleMarkBoughtResult = async (price: number | null) => {
     const scanId = identifiedItem?.scanId;
     if (!scanId) return;
@@ -1654,8 +1742,6 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
 
           {/* ── LEFT COLUMN — 45% ── */}
           <div className="w-[45%] flex-shrink-0 flex flex-col gap-4">
-            <PreScanChecklist visible={prescanVisible} onDismiss={() => setPrescanVisible(false)} />
-
             <div>
               <label className="block text-xs font-semibold text-gray-700 mb-1.5">What you pay in-store (£)</label>
               <div className="relative">
@@ -1884,6 +1970,18 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                   insufficientSoldData={identifiedItem.insufficientSoldData ?? false}
                   pipelineSystemWarning={identifiedItem.pipelineSystemWarning ?? null}
                   ebaySoldCompCount={identifiedItem.ebaySoldCompCount ?? 0}
+                  comparables={comparables}
+                  comparablesAveragePrice={
+                    identifiedItem.comparablesAveragePrice ?? comparables?.average_price ?? null
+                  }
+                  comparablesOverallConfidence={
+                    identifiedItem.comparablesOverallConfidence ??
+                    comparables?.overall_confidence ??
+                    null
+                  }
+                  comparablesUnavailableReason={comparablesUnavailableReason}
+                  removedComparableIds={removedComparableIds}
+                  onRemoveComparable={handleRemoveComparable}
                   onOpenMarkBought={() => setBoughtDialogOpen(true)}
                   onOpenMarkSold={() => setSoldDialogOpen(true)}
                   pricesLoading={pricesLoading}
@@ -2057,8 +2155,6 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
               <h2 className="text-2xl font-bold text-gray-900 mb-1">Scan an Item</h2>
               <p className="text-sm text-gray-500">Add up to three angles for clearer IDs and size reads</p>
             </div>
-
-            <PreScanChecklist visible={prescanVisible} onDismiss={() => setPrescanVisible(false)} className="mb-5" />
 
             <div className="mb-5 rounded-2xl border-2 border-gray-900/10 bg-white px-4 py-4 shadow-sm">
               <label className="block text-sm font-bold text-gray-900 mb-2">What are you paying for this piece? (£)</label>
@@ -2317,6 +2413,18 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
                   insufficientSoldData={identifiedItem.insufficientSoldData ?? false}
                   pipelineSystemWarning={identifiedItem.pipelineSystemWarning ?? null}
                   ebaySoldCompCount={identifiedItem.ebaySoldCompCount ?? 0}
+                  comparables={comparables}
+                  comparablesAveragePrice={
+                    identifiedItem.comparablesAveragePrice ?? comparables?.average_price ?? null
+                  }
+                  comparablesOverallConfidence={
+                    identifiedItem.comparablesOverallConfidence ??
+                    comparables?.overall_confidence ??
+                    null
+                  }
+                  comparablesUnavailableReason={comparablesUnavailableReason}
+                  removedComparableIds={removedComparableIds}
+                  onRemoveComparable={handleRemoveComparable}
                   onOpenMarkBought={() => setBoughtDialogOpen(true)}
                   onOpenMarkSold={() => setSoldDialogOpen(true)}
                   pricesLoading={pricesLoading}

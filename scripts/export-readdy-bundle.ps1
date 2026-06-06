@@ -26,7 +26,6 @@ $files = @(
   "src/pages/scan/components/ScanResultCard.tsx",
   "src/pages/scan/components/FlipScoreMeter.tsx",
   "src/pages/scan/components/ForensicAuthBanner.tsx",
-  "src/pages/scan/components/PreScanChecklist.tsx",
   "src/pages/share/scan-page.tsx",
   "src/pages/dashboard/page.tsx",
   "src/pages/dashboard/history/page.tsx",
@@ -35,6 +34,7 @@ $files = @(
   "src/pages/dashboard/components/NewScanSection.tsx",
   "src/pages/dashboard/components/DashboardScanResults.tsx",
   "src/pages/dashboard/components/BrandPerformanceCard.tsx",
+  "src/pages/home-logged-in/page.tsx",
   "src/router/config.tsx",
   "READDY_MANUAL_SYNC.md"
 )

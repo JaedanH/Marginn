@@ -3,6 +3,10 @@ import { useAuth } from '../../../context/AuthContext';
 import { supabaseFunctionUrl } from '../../../lib/supabaseFunctions';
 import { buildEffectiveMargin, encodeImageForScan, readNdjsonScanResponse } from '../../../lib/scanEdgeResponse';
 import {
+  resolveComparablesFromScanPayload,
+  type ComparablesPayload,
+} from '../../../lib/findBestComparables';
+import {
   formatScanErrorForDisplay,
   throwFromScanErrorPayload,
 } from '../../../lib/pipelineDiagnostics';
@@ -38,6 +42,10 @@ export interface ScanResult {
   platform_fee_gbp?: number;
   /** Fixed shipping assumption (£) */
   shipping_gbp?: number;
+  comparables?: ComparablesPayload | null;
+  comparables_average_price?: number | null;
+  comparables_overall_confidence?: number | null;
+  comparables_unavailable_reason?: string | null;
 }
 
 interface NewScanSectionProps {
@@ -111,6 +119,9 @@ function mapEdgeResponseToScanResult(data: Record<string, unknown>, buyPriceStr:
   const depopAvg =
     live?.depop.scraped && live.depop.avg > 0 ? Math.round(live.depop.avg) : Math.round(resale * 1.0);
 
+  const { payload: comparablesParsed, unavailableReason: comparablesUnavailable } =
+    resolveComparablesFromScanPayload(data);
+
   return {
     brand_name: brandName,
     product_line: [String(ai.sub_brand ?? ''), String(ai.item_type ?? '')].filter(Boolean).join(' · '),
@@ -138,6 +149,16 @@ function mapEdgeResponseToScanResult(data: Record<string, unknown>, buyPriceStr:
     era: String(ai.era ?? ''),
     platform_fee_gbp: platformFees,
     shipping_gbp: SHIPPING_COST,
+    comparables: comparablesParsed,
+    comparables_average_price:
+      typeof data.comparables_average_price === 'number'
+        ? data.comparables_average_price
+        : comparablesParsed?.average_price ?? null,
+    comparables_overall_confidence:
+      typeof data.comparables_overall_confidence === 'number'
+        ? data.comparables_overall_confidence
+        : comparablesParsed?.overall_confidence ?? null,
+    comparables_unavailable_reason: comparablesUnavailable,
   };
 }
 
