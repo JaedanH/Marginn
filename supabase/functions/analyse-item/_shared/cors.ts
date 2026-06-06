@@ -39,13 +39,19 @@ function isReaddyBrowserOrigin(hostname: string): boolean {
   );
 }
 
+/** Vercel production + preview deployments (marginn-dev, branch previews). */
+function isVercelBrowserOrigin(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return h === "vercel.app" || h.endsWith(".vercel.app");
+}
+
 export function resolveAllowedBrowserOrigin(originHeader: string | null | undefined): string | null {
   const o = originHeader?.trim() ?? "";
   if (!o) return null;
   if (ALLOWED_SET.has(o)) return o;
   try {
     const host = new URL(o).hostname;
-    if (isReaddyBrowserOrigin(host)) return o;
+    if (isReaddyBrowserOrigin(host) || isVercelBrowserOrigin(host)) return o;
   } catch {
     /* ignore malformed Origin */
   }
