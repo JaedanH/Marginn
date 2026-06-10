@@ -3,7 +3,14 @@ import { createClient, type Session } from '@supabase/supabase-js'
 const supabaseUrl = import.meta.env.VITE_PUBLIC_SUPABASE_URL as string;
 const supabaseAnonKey = import.meta.env.VITE_PUBLIC_SUPABASE_ANON_KEY as string;
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+// Late-bind fetch: consent/analytics scripts (e.g. CookieYes) that load before this
+// bundle can wrap window.fetch at startup and block Supabase auth calls with
+// "Failed to fetch". Resolving fetch at call time always uses the live native one.
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  global: {
+    fetch: (...args: Parameters<typeof fetch>) => fetch(...args),
+  },
+})
 
 /**
  * Headers for `fetch` to Edge Functions. Supabase expects:
