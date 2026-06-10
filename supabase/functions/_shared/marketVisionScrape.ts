@@ -13,7 +13,7 @@ const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const VISION_MODEL = "claude-sonnet-4-20250514";
 const SCRAPE_TIMEOUT_MS = 18_000;
 
-export type PriceExtractionMethod = "vision" | "regex_fallback" | "finding_api";
+export type PriceExtractionMethod = "vision" | "regex_fallback" | "finding_api" | "browse_api";
 
 export interface MarketListing {
   title: string;
@@ -333,9 +333,11 @@ export async function extractPlatformMarketData(args: {
   const { platform, searchUrl, brandName, itemType } = args;
 
   if (platform === "ebay") {
+    // Finding API (sold comps) was decommissioned by eBay on 2025-02-05;
+    // Browse API active listings are the best officially-available price signal.
     const keywords = (args.searchKeywords ?? keywordsFromEbaySearchUrl(searchUrl)).trim();
-    const { fetchEbaySoldViaFindingApi } = await import("./ebayFindingApi.ts");
-    return await fetchEbaySoldViaFindingApi({
+    const { fetchEbayActiveViaBrowseApi } = await import("./ebayBrowseApi.ts");
+    return await fetchEbayActiveViaBrowseApi({
       keywords,
       brandName,
       itemType,

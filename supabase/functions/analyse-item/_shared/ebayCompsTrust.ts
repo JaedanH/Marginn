@@ -5,7 +5,7 @@ export function ebayLiveCompCount(pricesLen: number, listingCardsLen: number): n
   return Math.max(pricesLen, listingCardsLen);
 }
 
-/** Finding API `totalEntries` counts sold comps even when only a page of listings is parsed. */
+/** API `total` counts comps even when only a page of listings is parsed. */
 export function resolveEbayCompCount(args: {
   method: string;
   soldCount: number;
@@ -13,7 +13,7 @@ export function resolveEbayCompCount(args: {
   listingCardsLen: number;
 }): number {
   const parsed = ebayLiveCompCount(args.pricesLen, args.listingCardsLen);
-  if (args.method === "finding_api" && args.soldCount > 0) {
+  if ((args.method === "finding_api" || args.method === "browse_api") && args.soldCount > 0) {
     return Math.max(args.soldCount, parsed);
   }
   return parsed;

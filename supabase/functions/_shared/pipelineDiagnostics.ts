@@ -215,13 +215,17 @@ export function buildCompletePipelineReport(args: {
   }
 
   if (!args.ebayFindingConfigured) {
-    stages.ebay_scrape = { status: "failed", code: E.MARKET_SCRAPE, detail: "EBAY_APP_ID not configured" };
-    warnings.push("eBay Finding API not configured");
+    stages.ebay_scrape = {
+      status: "failed",
+      code: E.MARKET_SCRAPE,
+      detail: "EBAY_APP_ID / EBAY_CERT_ID not configured",
+    };
+    warnings.push("eBay Browse API not configured");
   } else if (args.ebayScrapeRejected) {
     stages.ebay_scrape = { status: "failed", code: E.MARKET_SCRAPE };
-    warnings.push("eBay Finding API failed");
+    warnings.push("eBay Browse API failed");
   } else {
-    stages.ebay_scrape = { status: "ok", code: "finding_api" };
+    stages.ebay_scrape = { status: "ok", code: "browse_api" };
   }
   if (args.vintedScrapeRejected || args.depopScrapeRejected) {
     warnings.push("Secondary marketplace scrape had errors");

@@ -1,6 +1,6 @@
 /**
  * AI vision + marketplace scrape pipeline.
- * Edge secrets: ANTHROPIC_API_KEY, EBAY_APP_ID (Finding API), SCRAPINGBEE_API_KEY (Vinted/Depop only),
+ * Edge secrets: ANTHROPIC_API_KEY, EBAY_APP_ID + EBAY_CERT_ID (Browse API), SCRAPINGBEE_API_KEY (Vinted/Depop only),
  * SUPABASE_URL, SUPABASE_ANON_KEY,
  * SUPABASE_SERVICE_ROLE_KEY (required for `scan_identification_cache` + reliable `scans` insert + **plan RPM / `rate_limit_consume`**),
  * optional IMGBB_API_KEY (preferred; IMGBB_KEY fallback). Startup logs key prefix8 via `_shared/edgeSecrets.ts`.
@@ -37,6 +37,7 @@ import {
 import {
   anthropicKey,
   ebayAppIdDiag,
+  ebayCertIdDiag,
   imgbbKey,
   logEdgeSecretsAtStartup,
   scrapingBeeKeyDiag,
@@ -604,7 +605,7 @@ async function finishScanAfterVision(args: FinishScanArgs): Promise<Record<strin
       platform: "ebay" as const,
       prices: [],
       listings: [],
-      method: "finding_api" as const,
+      method: "browse_api" as const,
       soldCount: 0,
       lowConfidence: true,
       averageSoldPrice: null,
@@ -1051,7 +1052,7 @@ async function finishScanAfterVision(args: FinishScanArgs): Promise<Record<strin
     vintedScrapeRejected: vintedMarket.status === "rejected",
     depopScrapeRejected: depopMarket.status === "rejected",
     scrapingBeeConfigured: scrapingBeeKeyDiag().present,
-    ebayFindingConfigured: ebayAppIdDiag().present,
+    ebayFindingConfigured: ebayAppIdDiag().present && ebayCertIdDiag().present,
     scanPersist,
     identificationFromCache,
     visionSkipped: identificationFromCache,

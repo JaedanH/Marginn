@@ -45,6 +45,7 @@ function diag(names: readonly string[]): EdgeSecretDiag {
 
 const SCRAPINGBEE_ENV_NAMES = ["SCRAPINGBEE_API_KEY", "SCRAPINGBEE_KEY"] as const;
 const EBAY_APP_ID_ENV_NAMES = ["EBAY_APP_ID", "EBAY_FINDING_APP_ID"] as const;
+const EBAY_CERT_ID_ENV_NAMES = ["EBAY_CERT_ID", "EBAY_CERT_SECRET"] as const;
 const ANTHROPIC_ENV_NAMES = ["ANTHROPIC_API_KEY"] as const;
 const IMGBB_ENV_NAMES = ["IMGBB_API_KEY", "IMGBB_KEY"] as const;
 
@@ -57,18 +58,25 @@ export function logEdgeSecretsAtStartup(fn = "edge"): void {
 
   const scrapingbee = diag(SCRAPINGBEE_ENV_NAMES);
   const ebayApp = diag(EBAY_APP_ID_ENV_NAMES);
+  const ebayCert = diag(EBAY_CERT_ID_ENV_NAMES);
   const anthropic = diag(ANTHROPIC_ENV_NAMES);
   const imgbb = diag(IMGBB_ENV_NAMES);
 
   console.log(
     `[edge-secrets] ${fn} startup`,
     JSON.stringify({
-      ebay_finding: {
+      ebay_app: {
         present: ebayApp.present,
         source: ebayApp.source,
         prefix8: ebayApp.prefix8,
         length: ebayApp.length,
         checked: [...EBAY_APP_ID_ENV_NAMES],
+      },
+      ebay_cert: {
+        present: ebayCert.present,
+        source: ebayCert.source,
+        length: ebayCert.length,
+        checked: [...EBAY_CERT_ID_ENV_NAMES],
       },
       scrapingbee: {
         present: scrapingbee.present,
@@ -121,9 +129,18 @@ export function ebayAppIdDiag(): EdgeSecretDiag {
   return diag(EBAY_APP_ID_ENV_NAMES);
 }
 
-/** eBay Finding API production/sandbox App ID (SECURITY-APPNAME). */
+/** eBay App ID (client id) — used for Browse API OAuth. */
 export function ebayAppId(): string {
   return readFirstSecret(EBAY_APP_ID_ENV_NAMES).value;
+}
+
+export function ebayCertIdDiag(): EdgeSecretDiag {
+  return diag(EBAY_CERT_ID_ENV_NAMES);
+}
+
+/** eBay Cert ID (client secret) — pairs with EBAY_APP_ID for Browse API OAuth. */
+export function ebayCertId(): string {
+  return readFirstSecret(EBAY_CERT_ID_ENV_NAMES).value;
 }
 
 export function anthropicKey(): string {
