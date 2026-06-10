@@ -1,7 +1,9 @@
 import { createClient, type Session } from '@supabase/supabase-js'
 
-const supabaseUrl = import.meta.env.VITE_PUBLIC_SUPABASE_URL as string;
-const supabaseAnonKey = import.meta.env.VITE_PUBLIC_SUPABASE_ANON_KEY as string;
+// .trim() guards against invisible whitespace (e.g. non-breaking spaces) pasted
+// into hosting env vars — they make every fetch fail with "Failed to fetch".
+const supabaseUrl = (import.meta.env.VITE_PUBLIC_SUPABASE_URL as string).trim();
+const supabaseAnonKey = (import.meta.env.VITE_PUBLIC_SUPABASE_ANON_KEY as string).trim();
 
 // Late-bind fetch: consent/analytics scripts (e.g. CookieYes) that load before this
 // bundle can wrap window.fetch at startup and block Supabase auth calls with
