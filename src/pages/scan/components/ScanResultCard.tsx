@@ -267,6 +267,11 @@ export default function ScanResultCard({
   const [saved, setSaved] = useState(false);
   const [shareBusy, setShareBusy] = useState(false);
   const [revealStage, setRevealStage] = useState(1);
+  const [photoBroken, setPhotoBroken] = useState(false);
+
+  useEffect(() => {
+    setPhotoBroken(false);
+  }, [imageUrl, scanId, fingerprint]);
 
   useEffect(() => {
     const id = window.setInterval(() => setNowTick(Date.now()), 30_000);
@@ -412,8 +417,20 @@ export default function ScanResultCard({
     <div className="w-full max-w-md mx-auto">
       <div className="bg-white rounded-3xl overflow-hidden shadow-xl shadow-black/8 border border-gray-100">
         {/* Photo — full width at top */}
-        <div className="relative w-full h-64 bg-gray-100">
-          <img src={imageUrl} alt={brand} className="w-full h-full object-cover object-top" />
+        <div className="relative w-full aspect-[4/3] max-h-80 bg-gray-100">
+          {imageUrl && !photoBroken ? (
+            <img
+              src={imageUrl}
+              alt={brand}
+              className="w-full h-full object-cover object-top"
+              onError={() => setPhotoBroken(true)}
+            />
+          ) : (
+            <div className="w-full h-full min-h-[12rem] flex flex-col items-center justify-center gap-2 text-gray-400">
+              <i className="ri-image-line text-4xl" aria-hidden />
+              <p className="text-xs font-medium">Photo unavailable</p>
+            </div>
+          )}
           {pricesLoading ? (
             <div
               className="absolute top-4 right-4 h-9 w-24 rounded-full bg-gray-200/90 animate-pulse shadow-md ring-4 ring-gray-100"

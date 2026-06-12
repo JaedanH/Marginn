@@ -197,6 +197,18 @@ function clientScanFingerprintFallback(item: IdentifiedItem): string {
   return ((h >>> 0).toString(16).padStart(8, '0')).slice(0, 10);
 }
 
+/** Prefer Edge-hosted image URL; fall back to local preview blob. */
+function resolveScanDisplayImageUrl(
+  responseData: Record<string, unknown>,
+  previewUrl: string
+): string {
+  const hosted =
+    (typeof responseData.imageUrl === 'string' && responseData.imageUrl.trim()) ||
+    (typeof responseData.image_url === 'string' && responseData.image_url.trim()) ||
+    '';
+  return hosted || previewUrl;
+}
+
 function mapSoldCompPreviews(raw: unknown, scanId: string): ListingCacheRow[] {
   if (!Array.isArray(raw) || !scanId) return [];
   return raw.slice(0, 12).map((row, i) => {
@@ -252,8 +264,11 @@ function enrichIdentifiedWithTrust(
       ? pipelineReport.user_message
       : null;
 
+  const imageUrl = resolveScanDisplayImageUrl(responseData, item.imageUrl);
+
   return {
     ...item,
+    imageUrl,
     usedFallbackResale: usedFallback,
     identificationFromCache: responseData.identification_from_cache === true,
     scrapedAt: typeof responseData.scraped_at === 'string' ? responseData.scraped_at : null,
@@ -1056,9 +1071,13 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
     });
   };
 
-  const clearAllStagedPhotos = () => {
+  const clearAllStagedPhotos = (opts?: { preserveBlobUrl?: string }) => {
+    const preserve = opts?.preserveBlobUrl?.trim() || '';
     setStagedPhotos((prev) => {
-      prev.forEach((p) => URL.revokeObjectURL(p.preview));
+      prev.forEach((p) => {
+        if (preserve && p.preview === preserve) return;
+        URL.revokeObjectURL(p.preview);
+      });
       return [];
     });
   };
@@ -1183,10 +1202,12 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
         await new Promise<void>((r) => setTimeout(r, 650));
       }
 
+      const displayImageUrl = resolveScanDisplayImageUrl(responseData, heroPreviewUrl);
+
       // Support both new flat structure and legacy { ai, brand, livePrices } structure
       let result: IdentifiedItem;
       if (responseData.brand_name !== undefined) {
-        result = buildResultFromNewAPI(responseData, buyPrice, scanMode, heroPreviewUrl);
+        result = buildResultFromNewAPI(responseData, buyPrice, scanMode, displayImageUrl);
         // Always set searchTerm — use edge function query or fall back to brand + product line
         result.searchTerm = ((responseData.searchQuery as string) || '').trim()
           || [result.brand, result.productLine].filter(Boolean).join(' ');
@@ -1203,7 +1224,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
           searchQuery?: string;
           scanId?: string;
         };
-        result = buildResultFromAI(ai, brand, buyPrice, scanMode, heroPreviewUrl, livePrices);
+        result = buildResultFromAI(ai, brand, buyPrice, scanMode, displayImageUrl, livePrices);
         // Always set searchTerm — use edge function query or fall back to brand + item name
         result.searchTerm = (searchQuery || '').trim() || result.brand;
         if (scanId) result.scanId = scanId;
@@ -1480,7 +1501,9 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
         });
       }
 
-      clearAllStagedPhotos();
+      clearAllStagedPhotos({
+        preserveBlobUrl: result.imageUrl.startsWith('blob:') ? result.imageUrl : undefined,
+      });
 
       const persist = (responseData as AnalyseItemCompletePayload).scanPersist;
       const persistedImageUrl =
