@@ -43,7 +43,9 @@ import {
 } from '../../lib/forensicAuthentication';
 import {
   applyComparableRemoval,
+  hasAnyComparables,
   resolveComparablesFromScanPayload,
+  tryEnhanceComparablesPayload,
   recalculateMScoreFromComparables,
   type ComparableListing,
   type ComparablesPayload,
@@ -1364,20 +1366,41 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       const completePayload = responseData as AnalyseItemCompletePayload;
       const { payload: comparablesParsed, unavailableReason: comparablesReason } =
         resolveComparablesFromScanPayload(completePayload as Record<string, unknown>);
-      setComparables(comparablesParsed);
+
+      let finalComparables = comparablesParsed;
+      if (comparablesParsed && hasAnyComparables(comparablesParsed)) {
+        const aiForComps = (responseData as { ai?: Record<string, unknown> }).ai ?? {};
+        finalComparables = await tryEnhanceComparablesPayload(
+          comparablesParsed,
+          {
+            brand: result.brand || String(aiForComps.brand_name ?? ''),
+            itemType:
+              result.productLine ||
+              result.itemName ||
+              String(aiForComps.item_type ?? aiForComps.sub_brand ?? ''),
+            colour: String(aiForComps.colour ?? aiForComps.color ?? ''),
+            condition: String(result.conditionGrade ?? aiForComps.condition_grade ?? 'GOOD'),
+          },
+          comparablesParsed.m_score_recalc
+        );
+      }
+
+      setComparables(finalComparables);
       setComparablesUnavailableReason(comparablesReason);
-      if (comparablesParsed) {
+      if (finalComparables) {
         result = {
           ...result,
-          comparables: comparablesParsed,
+          comparables: finalComparables,
           comparablesAveragePrice:
-            typeof completePayload.comparables_average_price === 'number'
+            typeof completePayload.comparables_average_price === 'number' && !finalComparables.average_price
               ? completePayload.comparables_average_price
-              : comparablesParsed.average_price,
+              : finalComparables.average_price,
           comparablesOverallConfidence:
-            typeof completePayload.comparables_overall_confidence === 'number'
-              ? completePayload.comparables_overall_confidence
-              : comparablesParsed.overall_confidence,
+            finalComparables.overall_confidence > 0
+              ? finalComparables.overall_confidence
+              : typeof completePayload.comparables_overall_confidence === 'number'
+                ? completePayload.comparables_overall_confidence
+                : finalComparables.overall_confidence,
         };
       }
 

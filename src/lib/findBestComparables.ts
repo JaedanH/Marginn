@@ -1,7 +1,10 @@
 /**
  * Client mirror of Edge `findBestComparables` — types, scoring, removal recalc.
+ * Optional Haiku re-ranking via Edge `score-comparables` (never breaks scan on failure).
  */
 import { calculateMScore, type MScoreBrandTier } from './calculateMScore';
+import { edgeFunctionAuthHeaders } from '../supabaseClient';
+import { supabaseFunctionUrl } from './supabaseFunctions';
 
 export type ComparablePlatform = 'ebay' | 'vinted' | 'depop';
 
@@ -599,3 +602,377 @@ export const PLATFORM_BADGE: Record<
   vinted: { label: 'Vinted', className: 'bg-teal-100 text-teal-800 border-teal-200' },
   depop: { label: 'Depop', className: 'bg-pink-100 text-pink-800 border-pink-200' },
 };
+
+// ---------------------------------------------------------------------------
+// Haiku-enhanced comparables (optional — scan keeps server payload if this fails)
+// ---------------------------------------------------------------------------
+
+export interface ScannedItem {
+  brand: string;
+  itemType: string;
+  colour: string;
+  condition: string;
+}
+
+export interface ListingResult {
+  title: string;
+  price: number;
+  platform: ComparablePlatform;
+  url: string;
+  dateListed: string;
+  matchScore?: number;
+}
+
+export interface ComparablesResult {
+  topEbay: ListingResult[];
+  topVinted: ListingResult[];
+  topDepop: ListingResult[];
+  averagePrice: number;
+  confidenceScore: number;
+  reliable: boolean;
+  fallbackUsed: boolean;
+  error?: string;
+}
+
+const HAIKU_MATCH_THRESHOLD = 70;
+const HAIKU_MIN_STRONG_PER_PLATFORM = 3;
+const HAIKU_TIMEOUT_MS = 5000;
+
+function logComparable(msg: string, detail?: unknown): void {
+  if (detail !== undefined) console.warn(`[findBestComparables] ${msg}`, detail);
+  else console.warn(`[findBestComparables] ${msg}`);
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+function daysAgoFromIso(iso: string): number | null {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return null;
+  const days = Math.floor((Date.now() - ms) / 86_400_000);
+  return days >= 0 ? days : null;
+}
+
+function simpleAverage(prices: number[]): number {
+  const valid = prices.filter((p) => Number.isFinite(p) && p > 0);
+  if (valid.length === 0) return 0;
+  return Math.round((valid.reduce((a, b) => a + b, 0) / valid.length) * 100) / 100;
+}
+
+function trimmedMean(prices: number[]): number {
+  const valid = [...prices].filter((p) => Number.isFinite(p) && p > 0).sort((a, b) => a - b);
+  if (valid.length === 0) return 0;
+  if (valid.length < 5) return simpleAverage(valid);
+  const trim = Math.max(1, Math.floor(valid.length * 0.1));
+  const slice = valid.slice(trim, valid.length - trim);
+  if (slice.length === 0) return simpleAverage(valid);
+  return simpleAverage(slice);
+}
+
+function computeHaikuConfidence(
+  strongMatches: ListingResult[],
+  averagePrice: number
+): number {
+  if (strongMatches.length === 0 || averagePrice <= 0) return 0;
+  const countScore = clamp(strongMatches.length * 8, 0, 40);
+  const prices = strongMatches.map((l) => l.price);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const spread = max / Math.max(min, 1);
+  const spreadScore = spread <= 1.35 ? 35 : spread <= 2 ? 22 : spread <= 3 ? 12 : 4;
+  let recencySum = 0;
+  let recencyN = 0;
+  for (const row of strongMatches) {
+    const d = daysAgoFromIso(row.dateListed);
+    if (d === null) continue;
+    recencyN += 1;
+    if (d <= 30) recencySum += 100;
+    else if (d <= 60) recencySum += 80;
+    else if (d <= 90) recencySum += 60;
+    else recencySum += 30;
+  }
+  const recencyScore = recencyN > 0 ? (recencySum / recencyN) * 0.25 : 15;
+  return Math.round(clamp(countScore + spreadScore + recencyScore, 0, 100));
+}
+
+function topNByPlatform(rows: ListingResult[], platform: ComparablePlatform, n = 5): ListingResult[] {
+  return rows.filter((r) => r.platform === platform).slice(0, n);
+}
+
+export function buildFallbackResult(
+  ebayResults: ListingResult[],
+  vintedResults: ListingResult[],
+  depopResults: ListingResult[],
+  error?: string
+): ComparablesResult {
+  const all = [...ebayResults, ...vintedResults, ...depopResults].filter(
+    (r) => isNonEmptyString(r.title) && Number.isFinite(r.price) && r.price > 0
+  );
+  const avg = simpleAverage(all.map((r) => r.price));
+  return {
+    topEbay: topNByPlatform(all, 'ebay'),
+    topVinted: topNByPlatform(all, 'vinted'),
+    topDepop: topNByPlatform(all, 'depop'),
+    averagePrice: avg,
+    confidenceScore: all.length >= 5 ? Math.min(45, all.length * 5) : 0,
+    reliable: false,
+    fallbackUsed: true,
+    error,
+  };
+}
+
+async function scoreListingsWithHaiku(
+  scannedItem: ScannedItem,
+  listings: ListingResult[]
+): Promise<number[] | null> {
+  if (listings.length === 0) return [];
+  try {
+    const headers = await edgeFunctionAuthHeaders();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HAIKU_TIMEOUT_MS);
+    const res = await fetch(supabaseFunctionUrl('score-comparables'), {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        scannedItem,
+        listings: listings.map((l) => ({
+          title: l.title,
+          price: l.price,
+          platform: l.platform,
+          dateListed: l.dateListed,
+        })),
+      }),
+    }).finally(() => clearTimeout(timer));
+
+    if (!res.ok) {
+      logComparable('Haiku edge call failed', res.status);
+      return null;
+    }
+    const json = (await res.json()) as { scores?: unknown[]; error?: string };
+    if (!Array.isArray(json.scores)) {
+      logComparable('Haiku response missing scores', json.error);
+      return null;
+    }
+    if (json.scores.length !== listings.length) {
+      logComparable('Haiku score length mismatch');
+      return null;
+    }
+    const normalized = json.scores.map((s) => {
+      const n = typeof s === 'number' ? s : Number(s);
+      if (!Number.isFinite(n)) return 0;
+      return clamp(Math.round(n), 0, 100);
+    });
+    const zeroCount = normalized.filter((s) => s === 0).length;
+    if (zeroCount / normalized.length > 0.5) {
+      logComparable('Haiku returned mostly zero scores');
+      return null;
+    }
+    return normalized;
+  } catch (e) {
+    logComparable('Haiku scoring error', e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
+function applyScores(listings: ListingResult[], scores: number[]): ListingResult[] {
+  return listings.map((l, i) => ({ ...l, matchScore: scores[i] ?? 0 }));
+}
+
+function filterRankAndSlice(rows: ListingResult[]): ListingResult[] {
+  return rows
+    .filter((r) => (r.matchScore ?? 0) >= HAIKU_MATCH_THRESHOLD)
+    .sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0));
+}
+
+/**
+ * Haiku-enhanced comparable matching. Never throws — always returns ComparablesResult.
+ * On any failure uses buildFallbackResult (simple average, reliable: false).
+ */
+export async function findBestComparables(
+  scannedItem: ScannedItem,
+  ebayResults: ListingResult[],
+  vintedResults: ListingResult[],
+  depopResults: ListingResult[]
+): Promise<ComparablesResult> {
+  try {
+    const ebay = Array.isArray(ebayResults) ? ebayResults : [];
+    const vinted = Array.isArray(vintedResults) ? vintedResults : [];
+    const depop = Array.isArray(depopResults) ? depopResults : [];
+
+    if (!isNonEmptyString(scannedItem?.brand) || !isNonEmptyString(scannedItem?.itemType)) {
+      return buildFallbackResult(ebay, vinted, depop, 'missing brand or itemType');
+    }
+
+    const total = ebay.length + vinted.length + depop.length;
+    if (total === 0) {
+      return buildFallbackResult([], [], [], 'no listing results');
+    }
+
+    if (total < 5) {
+      return buildFallbackResult(ebay, vinted, depop, 'fewer than 5 total listings');
+    }
+
+    const combined = [...ebay, ...vinted, ...depop];
+    const haikuScores = await scoreListingsWithHaiku(scannedItem, combined);
+    if (!haikuScores) {
+      return buildFallbackResult(ebay, vinted, depop, 'Haiku scoring unavailable');
+    }
+
+    const scored = applyScores(combined, haikuScores);
+    const ebayStrong = filterRankAndSlice(scored.filter((r) => r.platform === 'ebay'));
+    const vintedStrong = filterRankAndSlice(scored.filter((r) => r.platform === 'vinted'));
+    const depopStrong = filterRankAndSlice(scored.filter((r) => r.platform === 'depop'));
+
+    const strongAll = [...ebayStrong, ...vintedStrong, ...depopStrong];
+    const averagePrice = trimmedMean(strongAll.map((r) => r.price));
+    const confidenceScore = computeHaikuConfidence(strongAll, averagePrice);
+
+    const reliable =
+      ebayStrong.length >= HAIKU_MIN_STRONG_PER_PLATFORM &&
+      vintedStrong.length >= HAIKU_MIN_STRONG_PER_PLATFORM &&
+      depopStrong.length >= HAIKU_MIN_STRONG_PER_PLATFORM;
+
+    return {
+      topEbay: ebayStrong.slice(0, 5),
+      topVinted: vintedStrong.slice(0, 5),
+      topDepop: depopStrong.slice(0, 5),
+      averagePrice,
+      confidenceScore,
+      reliable,
+      fallbackUsed: false,
+    };
+  } catch (e) {
+    logComparable('unexpected error', e);
+    return buildFallbackResult(
+      ebayResults ?? [],
+      vintedResults ?? [],
+      depopResults ?? [],
+      e instanceof Error ? e.message : 'unknown error'
+    );
+  }
+}
+
+function listingResultFromComparable(l: ComparableListing): ListingResult {
+  return {
+    title: l.title,
+    price: l.price,
+    platform: l.platform,
+    url: l.url,
+    dateListed: l.date_at ?? new Date().toISOString(),
+    matchScore: l.match_percent,
+  };
+}
+
+export function listingResultsFromPayload(payload: ComparablesPayload): {
+  ebay: ListingResult[];
+  vinted: ListingResult[];
+  depop: ListingResult[];
+} {
+  const seen = new Set<string>();
+  const ebay: ListingResult[] = [];
+  const vinted: ListingResult[] = [];
+  const depop: ListingResult[] = [];
+
+  const push = (l: ComparableListing) => {
+    if (seen.has(l.id)) return;
+    seen.add(l.id);
+    const row = listingResultFromComparable(l);
+    if (l.platform === 'ebay') ebay.push(row);
+    else if (l.platform === 'vinted') vinted.push(row);
+    else depop.push(row);
+  };
+
+  for (const l of payload.all_passing) push(l);
+  for (const l of payload.ebay.top5) push(l);
+  for (const l of payload.vinted.top5) push(l);
+  for (const l of payload.depop.top5) push(l);
+
+  return { ebay, vinted, depop };
+}
+
+export function comparablesPayloadFromHaikuResult(
+  result: ComparablesResult,
+  mScoreRecalc?: ComparablesPayload['m_score_recalc']
+): ComparablesPayload {
+  const toListing = (lr: ListingResult): ComparableListing => ({
+    id: stableId(lr.platform, lr.title, lr.price, lr.url),
+    platform: lr.platform,
+    title: lr.title,
+    price: lr.price,
+    date_at: lr.dateListed || null,
+    days_ago: daysAgoFromIso(lr.dateListed),
+    match_percent: lr.matchScore ?? 0,
+    url: lr.url,
+  });
+
+  const slice = (rows: ListingResult[]): PlatformComparablesSlice => {
+    const top5 = rows.slice(0, 5).map(toListing);
+    const strong = rows.filter((r) => (r.matchScore ?? 0) >= HAIKU_MATCH_THRESHOLD).length;
+    return {
+      top5,
+      strong_match_count: strong,
+      low_confidence: strong < HAIKU_MIN_STRONG_PER_PLATFORM,
+    };
+  };
+
+  const allStrong = [...result.topEbay, ...result.topVinted, ...result.topDepop]
+    .filter((r) => (r.matchScore ?? 0) >= HAIKU_MATCH_THRESHOLD)
+    .sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0))
+    .map(toListing);
+
+  return {
+    ebay: slice(result.topEbay),
+    vinted: slice(result.topVinted),
+    depop: slice(result.topDepop),
+    all_passing: allStrong,
+    average_price: result.averagePrice > 0 ? result.averagePrice : null,
+    overall_confidence: result.confidenceScore,
+    m_score_recalc: mScoreRecalc,
+  };
+}
+
+/**
+ * Optionally re-rank server comparables with Haiku. Returns original payload if enhancement fails.
+ */
+export async function tryEnhanceComparablesPayload(
+  existing: ComparablesPayload,
+  scannedItem: ScannedItem,
+  mScoreRecalc?: ComparablesPayload['m_score_recalc']
+): Promise<ComparablesPayload> {
+  try {
+    if (!hasAnyComparables(existing)) return existing;
+    const { ebay, vinted, depop } = listingResultsFromPayload(existing);
+    const result = await findBestComparables(scannedItem, ebay, vinted, depop);
+    if (result.fallbackUsed) {
+      logComparable('enhancement skipped — using server comparables', result.error);
+      return existing;
+    }
+    return comparablesPayloadFromHaikuResult(result, mScoreRecalc ?? existing.m_score_recalc);
+  } catch (e) {
+    logComparable('enhancement error — using server comparables', e);
+    return existing;
+  }
+}
+
+if (import.meta.env.DEV) {
+  const testItem: ScannedItem = {
+    brand: 'Nike',
+    itemType: 'hoodie',
+    colour: 'black',
+    condition: 'good',
+  };
+  const testResults: ListingResult[] = [
+    {
+      title: 'Nike Black Hoodie',
+      price: 45,
+      platform: 'ebay',
+      url: '',
+      dateListed: new Date().toISOString(),
+    },
+  ];
+  findBestComparables(testItem, testResults, [], [])
+    .then((r) => console.log('[findBestComparables] smoke test passed', r))
+    .catch((e) => console.error('[findBestComparables] smoke test failed', e));
+}

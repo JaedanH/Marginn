@@ -119,7 +119,7 @@ export default function ComparablesSection({
         <div>
           <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Comparable items</p>
           <p className="text-[11px] text-gray-500 mt-0.5 leading-snug">
-            Text-matched listings (55%+). Tap to open; remove outliers to refresh averages.
+            AI-matched listings (70%+). Tap to open; remove outliers to refresh averages.
           </p>
         </div>
         {!pricesLoading && averagePrice != null && averagePrice > 0 ? (
@@ -136,7 +136,7 @@ export default function ComparablesSection({
       ) : null}
       {!hasAny ? (
         <p className="text-xs text-gray-600 leading-snug">
-          No listings scored 55%+ on brand, type, condition, and colour. Try a clearer photo or browse
+          No listings scored 70%+ on brand, type, condition, and colour. Try a clearer photo or browse
           platform links below.
         </p>
       ) : (
