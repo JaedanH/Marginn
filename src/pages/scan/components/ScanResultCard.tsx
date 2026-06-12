@@ -275,17 +275,21 @@ export default function ScanResultCard({
 
   useEffect(() => {
     setRevealStage(1);
-    const t2 = window.setTimeout(() => setRevealStage(2), 500);
-    const t3 = window.setTimeout(() => setRevealStage(3), 1000);
-    const t4 = window.setTimeout(() => setRevealStage(4), 1500);
-    const t5 = window.setTimeout(() => setRevealStage(5), 2000);
+  }, [scanId, fingerprint, brand, imageUrl]);
+
+  // Stages 2–5 start when pricing data is ready (same data as before — visual timing only).
+  useEffect(() => {
+    if (pricesLoading) return;
+    setRevealStage(2);
+    const t3 = window.setTimeout(() => setRevealStage(3), 500);
+    const t4 = window.setTimeout(() => setRevealStage(4), 1000);
+    const t5 = window.setTimeout(() => setRevealStage(5), 1500);
     return () => {
-      window.clearTimeout(t2);
       window.clearTimeout(t3);
       window.clearTimeout(t4);
       window.clearTimeout(t5);
     };
-  }, [scanId, fingerprint, brand, imageUrl]);
+  }, [scanId, fingerprint, brand, imageUrl, pricesLoading]);
 
   const stageFade = (stage: number) =>
     `transition-opacity duration-500 ease-out ${revealStage >= stage ? 'opacity-100' : 'opacity-0'}`;

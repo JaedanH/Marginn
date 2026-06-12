@@ -1487,6 +1487,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
         (responseData as { imageUrl?: string }).imageUrl?.trim() || null;
       const buyPriceNum = buyPrice ? parseFloat(buyPrice) : 0;
 
+      let persistOk = true;
       if (effectiveUserId && result.scanId) {
         const persistOutcome = await ensureScanPersisted({
           scanId: result.scanId,
@@ -1500,6 +1501,7 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
           edgePersist: persist,
         });
         if (!persistOutcome.ok) {
+          persistOk = false;
           const pe = persist?.error;
           showToast(
             pe
@@ -1509,6 +1511,9 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
           );
         } else {
           console.log('[Scan] history row ok', persistOutcome.source, result.scanId);
+          setIdentifiedItem((prev) =>
+            prev ? { ...prev, pipelineSystemWarning: null } : prev,
+          );
         }
       } else if (!result.scanId) {
         console.warn('[Scan] no scanId returned from edge function — scan_id FK will be null on save');
@@ -1518,10 +1523,12 @@ export default function ScanPage({ embedded = false }: ScanPageProps) {
       // ─────────────────────────────────────────────────────────────────────
 
       // ── Decrement scan count for limited-plan users ───────────────────────
-      try {
-        await decrementScan();
-      } catch (decrementErr) {
-        console.error('[Scan] Failed to decrement scan count:', decrementErr);
+      if (persistOk) {
+        try {
+          await decrementScan();
+        } catch (decrementErr) {
+          console.error('[Scan] Failed to decrement scan count:', decrementErr);
+        }
       }
       // ─────────────────────────────────────────────────────────────────────
 
