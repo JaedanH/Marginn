@@ -266,11 +266,29 @@ export default function ScanResultCard({
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [saved, setSaved] = useState(false);
   const [shareBusy, setShareBusy] = useState(false);
+  const [revealStage, setRevealStage] = useState(1);
 
   useEffect(() => {
     const id = window.setInterval(() => setNowTick(Date.now()), 30_000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    setRevealStage(1);
+    const t2 = window.setTimeout(() => setRevealStage(2), 500);
+    const t3 = window.setTimeout(() => setRevealStage(3), 1000);
+    const t4 = window.setTimeout(() => setRevealStage(4), 1500);
+    const t5 = window.setTimeout(() => setRevealStage(5), 2000);
+    return () => {
+      window.clearTimeout(t2);
+      window.clearTimeout(t3);
+      window.clearTimeout(t4);
+      window.clearTimeout(t5);
+    };
+  }, [scanId, fingerprint, brand, imageUrl]);
+
+  const stageFade = (stage: number) =>
+    `transition-opacity duration-500 ease-out ${revealStage >= stage ? 'opacity-100' : 'opacity-0'}`;
 
   const vc = VERDICT_CONFIG[verdict];
 
@@ -389,19 +407,7 @@ export default function ScanResultCard({
   return (
     <div className="w-full max-w-md mx-auto">
       <div className="bg-white rounded-3xl overflow-hidden shadow-xl shadow-black/8 border border-gray-100">
-        {(authenticationFlags?.length ?? 0) > 0 ? (
-          <div className="bg-rose-600 text-white px-4 py-3 flex gap-2.5 items-start border-b border-rose-700/30">
-            <i className="ri-alarm-warning-fill text-lg shrink-0 mt-0.5" aria-hidden />
-            <div className="min-w-0">
-              <p className="text-[10px] font-black uppercase tracking-wider opacity-95">Authenticity caution</p>
-              <p className="text-xs font-semibold leading-snug mt-1 break-words">
-                {authenticationFlags.join(' · ')}
-              </p>
-            </div>
-          </div>
-        ) : null}
-
-        {/* Photo */}
+        {/* Photo — full width at top */}
         <div className="relative w-full h-64 bg-gray-100">
           <img src={imageUrl} alt={brand} className="w-full h-full object-cover object-top" />
           {pricesLoading ? (
@@ -414,13 +420,65 @@ export default function ScanResultCard({
               {vc.label}
             </div>
           )}
-          <button
-            onClick={handleSave}
-            className="absolute top-4 left-4 w-9 h-9 flex items-center justify-center bg-white/90 backdrop-blur-sm rounded-full shadow-md hover:bg-white transition-all cursor-pointer"
-          >
-            <i className={`${saved ? 'ri-bookmark-fill text-black' : 'ri-bookmark-line text-gray-700'} text-base`}></i>
-          </button>
+          <div className="absolute top-4 left-4 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleSave}
+              className="w-9 h-9 flex items-center justify-center bg-white/90 backdrop-blur-sm rounded-full shadow-md hover:bg-white transition-all cursor-pointer"
+              aria-label={saved ? 'Saved' : 'Save item'}
+            >
+              <i className={`${saved ? 'ri-bookmark-fill text-black' : 'ri-bookmark-line text-gray-700'} text-base`}></i>
+            </button>
+            {shareUrl?.trim() ? (
+              <button
+                type="button"
+                onClick={handleShare}
+                disabled={shareBusy}
+                className="w-9 h-9 flex items-center justify-center bg-white/90 backdrop-blur-sm rounded-full shadow-md hover:bg-white transition-all cursor-pointer disabled:opacity-50"
+                aria-label="Share scan"
+              >
+                <i className={`ri-share-forward-line text-gray-700 text-base ${shareBusy ? 'animate-pulse' : ''}`}></i>
+              </button>
+            ) : null}
+          </div>
         </div>
+
+        {/* Stage 1 — brand, condition, verdict badge (on photo) */}
+        <div className="px-5 pt-4 pb-1">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="text-xl font-bold text-gray-900 leading-tight">{brand}</p>
+              {gptVerified && (
+                <span className="flex items-center gap-1 bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-bold px-2 py-0.5 rounded-full whitespace-nowrap">
+                  <i className="ri-checkbox-circle-fill text-emerald-500 text-xs"></i>
+                  GPT Verified
+                </span>
+              )}
+            </div>
+            {productLine && <p className="text-sm font-medium text-gray-700 mt-0.5 leading-snug">{productLine}</p>}
+            <p className="text-sm text-gray-400 mt-0.5">{condition}</p>
+            {sizeLabel?.trim() ? (
+              <p className="text-xs font-semibold text-gray-600 mt-1">Size on tag: {sizeLabel.trim()}</p>
+            ) : null}
+            {fingerprint ? (
+              <p className="text-[10px] text-gray-400 mt-1 font-mono tracking-tight" title="Deterministic scan fingerprint">
+                Fingerprint {fingerprint}
+              </p>
+            ) : null}
+          </div>
+        </div>
+
+        {(authenticationFlags?.length ?? 0) > 0 ? (
+          <div className="bg-rose-600 text-white px-4 py-3 flex gap-2.5 items-start border-b border-rose-700/30 mx-0">
+            <i className="ri-alarm-warning-fill text-lg shrink-0 mt-0.5" aria-hidden />
+            <div className="min-w-0">
+              <p className="text-[10px] font-black uppercase tracking-wider opacity-95">Authenticity caution</p>
+              <p className="text-xs font-semibold leading-snug mt-1 break-words">
+                {authenticationFlags.join(' · ')}
+              </p>
+            </div>
+          </div>
+        ) : null}
 
         <ForensicAuthBanner
           loading={forensicAuthLoading}
@@ -428,7 +486,7 @@ export default function ScanResultCard({
           score={forensicAuthScore}
         />
 
-        <div className="px-5 pt-5 pb-6 space-y-5">
+        <div className="px-5 pt-4 pb-6 space-y-5">
 
           {!pricesLoading &&
             typeof flipScore === 'number' &&
@@ -439,44 +497,11 @@ export default function ScanResultCard({
                 score={flipScore}
                 breakdown={flipScoreBreakdown}
                 soldVelocity={soldVelocity}
+                revealStage={revealStage}
               />
             )}
 
-          {/* Brand + Product Line + Condition */}
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <p className="text-xl font-bold text-gray-900 leading-tight">{brand}</p>
-                {gptVerified && (
-                  <span className="flex items-center gap-1 bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-bold px-2 py-0.5 rounded-full whitespace-nowrap">
-                    <i className="ri-checkbox-circle-fill text-emerald-500 text-xs"></i>
-                    GPT Verified
-                  </span>
-                )}
-              </div>
-              {productLine && <p className="text-sm font-medium text-gray-700 mt-0.5 leading-snug">{productLine}</p>}
-              <p className="text-sm text-gray-400 mt-0.5">{condition}</p>
-              {sizeLabel?.trim() ? (
-                <p className="text-xs font-semibold text-gray-600 mt-1">Size on tag: {sizeLabel.trim()}</p>
-              ) : null}
-              {fingerprint ? (
-                <p className="text-[10px] text-gray-400 mt-1 font-mono tracking-tight" title="Deterministic scan fingerprint">
-                  Fingerprint {fingerprint}
-                </p>
-              ) : null}
-            </div>
-            <div className="flex flex-col items-end gap-1.5 flex-shrink-0">
-              {pricesLoading ? (
-                <div className="h-7 w-20 rounded-full bg-gray-200 animate-pulse" aria-hidden />
-              ) : (
-                <span className={`px-4 py-1.5 rounded-full text-xs font-black tracking-widest ${vc.bg} ${vc.text}`}>
-                  {vc.label}
-                </span>
-              )}
-            </div>
-          </div>
-
-          {/* Market + impact copy */}
+          {/* Market + impact copy — stage 4 */}
           {pricesLoading ? (
             <div className="rounded-2xl border border-gray-100 bg-gray-50/90 px-4 py-3 space-y-2.5 animate-pulse" aria-busy>
               <div className="h-2.5 bg-gray-200 rounded w-28" />
@@ -486,7 +511,7 @@ export default function ScanResultCard({
               <div className="h-3 bg-gray-200 rounded w-[70%]" />
             </div>
           ) : (
-          <div className="rounded-2xl border border-gray-100 bg-gray-50/90 px-4 py-3 space-y-2">
+          <div className={`rounded-2xl border border-gray-100 bg-gray-50/90 px-4 py-3 space-y-2 ${stageFade(4)}`}>
             <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Market signals</p>
             {priceTrend.status === 'trend' ? (
               <p className="text-xs text-gray-800 font-semibold leading-snug flex gap-2 items-start">
@@ -641,15 +666,17 @@ export default function ScanResultCard({
           ) : null}
 
           {!pricesLoading && (comparables || comparablesUnavailableReason) ? (
-            <ComparablesSection
-              comparables={comparables}
-              averagePrice={comparablesAveragePrice}
-              overallConfidence={comparablesOverallConfidence}
-              removedIds={removedComparableIds ?? new Set()}
-              onRemove={onRemoveComparable}
-              pricesLoading={pricesLoading}
-              unavailableReason={comparablesUnavailableReason}
-            />
+            <div className={stageFade(5)}>
+              <ComparablesSection
+                comparables={comparables}
+                averagePrice={comparablesAveragePrice}
+                overallConfidence={comparablesOverallConfidence}
+                removedIds={removedComparableIds ?? new Set()}
+                onRemove={onRemoveComparable}
+                pricesLoading={pricesLoading}
+                unavailableReason={comparablesUnavailableReason}
+              />
+            </div>
           ) : null}
 
           {/* ── eBay section ── */}
